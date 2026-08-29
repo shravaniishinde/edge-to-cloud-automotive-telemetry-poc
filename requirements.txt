@@ -1,0 +1,8 @@
+# Dependencies are added incrementally, one phase at a time, as each phase
+# introduces a real need for them. See ARCHITECTURE.md for the phase plan.
+#
+# Expected additions (not yet installed):
+#   Phase 1 - python-can, pytest, (pydantic - pending confirmation)
+#   Phase 3 - paho-mqtt
+#   Phase 9 - anthropic
+#   Phase 10 - fastapi, uvicorn (dashboard backend) - to be confirmed at that phase

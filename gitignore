@@ -1,0 +1,46 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# --- Environment / secrets ---
+# Real environment files must never be committed. Only .env.example is tracked.
+.env
+.env.*
+!.env.example
+*.pem
+*.crt
+*.key
+*.p12
+aws-credentials*
+
+# --- Local data / buffers (created at runtime, not source) ---
+*.sqlite3
+*.db
+
+# --- Docker ---
+docker/volumes/
+
+# --- Terraform (introduced Phase 5) ---
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+crash.log
+
+# --- Dashboard frontend (introduced Phase 10) ---
+node_modules/
+dist/
+build/
+
+# --- OS / editor ---
+.DS_Store
+.vscode/
+.idea/
