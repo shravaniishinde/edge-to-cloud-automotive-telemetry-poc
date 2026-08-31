@@ -37,19 +37,36 @@ phase reviewed before the next begins. See [ARCHITECTURE.md](ARCHITECTURE.md)
 for the full architecture, the phase plan, and the reasoning behind every
 major technical decision.
 
-**Current status: Phase 0 complete** — repository scaffolding only. No
-simulation, gateway, or cloud code exists yet.
+**Current status: Phase 1 complete** — a simulated 3-ECU vehicle network
+publishes realistic telemetry over a virtual CAN bus, and a shared
+`TelemetryEvent` schema (`common/`) is in place for every later component
+to reuse. No Edge Gateway, UDS, cloud, or dashboard code exists yet.
 
 ## Requirements
 
 This list grows as each phase introduces a real dependency:
 
-- Python 3.x
+- Python 3.11 (see `requirements.txt` for pinned package versions)
 - Docker & Docker Compose (introduced in Phase 3)
 - An AWS account (introduced in Phase 5; all resources are provisioned via
   Terraform and designed to be torn down cleanly after use)
 
 ## Getting started
 
-There is nothing runnable yet. Setup instructions will be added here as
-each phase introduces something to run.
+```bash
+pip install -r requirements.txt   # add --break-system-packages on Debian/Ubuntu system Python
+
+# Run the test suite
+pytest
+
+# Run the live simulation for 5 seconds, with a fixed seed for reproducible output
+python -m simulation.run_simulation --duration 5 --seed 42
+
+# Same, but log every CAN frame sent (otherwise only start/stop are logged)
+python -m simulation.run_simulation --duration 5 --seed 42 --verbose
+```
+
+There is no cloud, gateway, or dashboard to run yet — those arrive in
+later phases. See [ARCHITECTURE.md](ARCHITECTURE.md) for the full phase
+plan and [docs/can-signal-spec.md](docs/can-signal-spec.md) for exactly
+what the simulated vehicle transmits.

@@ -1,8 +1,15 @@
 # Dependencies are added incrementally, one phase at a time, as each phase
 # introduces a real need for them. See ARCHITECTURE.md for the phase plan.
-#
-# Expected additions (not yet installed):
-#   Phase 1 - python-can, pytest, (pydantic - pending confirmation)
+# Versions are pinned exactly to what was installed and tested against,
+# rather than left open-ended, so a future dependency release can't
+# silently change behaviour underneath this project.
+
+# --- Phase 1: vehicle simulation + shared schema foundation ---
+python-can==4.6.1      # virtual CAN bus for the simulated ECUs
+pydantic==2.13.3        # TelemetryEvent schema validation
+pytest==9.1.1           # test runner
+
+# Expected future additions (not yet installed):
 #   Phase 3 - paho-mqtt
 #   Phase 9 - anthropic
 #   Phase 10 - fastapi, uvicorn (dashboard backend) - to be confirmed at that phase

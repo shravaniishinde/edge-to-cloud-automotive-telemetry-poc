@@ -19,9 +19,9 @@ stays reasonable for a personal project.
 ## 2. System architecture
 
 ```
-[Powertrain ECU] [Battery ECU] [Body ECU]   (3 simulated processes)
-        \             |             /
-         \            |            /
+[Powertrain ECU] [Battery ECU] [Body ECU]   (3 logical ECUs, each its own
+        \             |             /        thread within one process —
+         \            |            /         see the correction below)
           virtual CAN bus (python-can "virtual" interface)
                       |
          UDS diagnostic client <-> one ECU acting as UDS server
@@ -39,11 +39,22 @@ stays reasonable for a personal project.
    (later) Dashboard backend (REST + WebSocket) reads gateway state directly
 ```
 
+**Correction found during Phase 1 planning:** `python-can`'s virtual
+interface shares frames between `Bus` objects only *within the same OS
+process* (confirmed with a smoke test) — it's an in-memory registry, not a
+real inter-process transport. So the 3 ECUs are 3 separate Python classes
+running as threads inside one process, not 3 separate OS processes as an
+earlier draft of this diagram implied. This doesn't change any decision
+above; it's simply the accurate mechanics of the tool we chose.
+
 ### Component responsibilities
 
-- **Simulated ECUs** — independent processes that generate realistic
-  telemetry values (e.g. vehicle speed, RPM, battery state of charge) and
-  publish them as CAN frames on the virtual bus, at defined rates.
+- **Simulated ECUs** — 3 logical ECUs (Powertrain, Battery/Energy,
+  Body/Status), each its own thread sharing the virtual bus. A CAN ID
+  identifies one *message*, not an ECU — each ECU owns several CAN IDs
+  (11 messages total; see `docs/can-signal-spec.md`). Each ECU generates
+  realistic, slowly-drifting telemetry values and publishes them as CAN
+  frames at that ECU's own rate (10 Hz / 2 Hz / 1 Hz).
 - **UDS diagnostic layer** — a small client/server pair implementing a
   deliberately limited slice of ISO 14229 (UDS): `DiagnosticSessionControl`,
   `ReadDataByIdentifier`, and `ReadDTCInformation`. This is enough to
@@ -79,34 +90,38 @@ stays reasonable for a personal project.
 | LLM analysis is batch/on-demand, never real-time per-message | Avoids latency, cost, and CI flakiness. The deterministic rule engine is authoritative for anomaly detection; the LLM's output is always labeled advisory and is mocked in automated tests. |
 | Shared telemetry data model (`common/`) | A single canonical schema (analogous to a DBC file's role in a real vehicle network) used by the simulator, Edge Gateway, cloud integration, analyzer, and dashboard, so all components agree on one event shape instead of drifting JSON conventions. Introduced incrementally: `TelemetryEvent` (Phase 1), `DiagnosticEvent` (Phase 2), an operational/metrics event shape (Phase 4/6). |
 | Repository scaffolding is incremental | Directories and files are created only when the phase that needs them begins — the structure below is the destination, not something built upfront. |
-| Dependency management via plain `requirements.txt` | Kept intentionally simple (no Poetry/pyproject) and starts empty, gaining entries only as each phase introduces a real dependency. |
+| Dependency management via plain `requirements.txt` | Kept intentionally simple (no Poetry/pyproject) and starts empty, gaining entries only as each phase introduces a real dependency. Versions are pinned exactly to what was installed and tested against. |
 | CI introduced early, grown incrementally | A minimal GitHub Actions workflow appears at Phase 1 and runs whatever test suite exists at the time, rather than being bolted on at the end. |
-
-**Open decision (to be finalized at Phase 1):** whether `common/` schema
-classes are implemented as **Pydantic models** (built-in validation and
-JSON serialization — directly useful for the Edge Gateway's validation
-responsibility, at the cost of one more dependency) or **plain dataclasses
-with hand-written validation** (more verbose, fully transparent, one fewer
-dependency). Default recommendation is Pydantic; will be confirmed before
-Phase 1 code is written.
+| `TelemetryEvent` schemas built with Pydantic | Decided at Phase 1: validation (types, required fields, known enum values) and serialization come built-in, which is directly useful since "validate" is a named Edge Gateway responsibility. The trade-off (one more dependency, some implicit behavior) was accepted over hand-written dataclass validation. |
+| A CAN ID identifies a message, not an ECU | Corrected during Phase 1 planning: one logical ECU can own several CAN IDs. This vehicle's 3 ECUs own 11 CAN messages between them (3 + 4 + 4) — see `docs/can-signal-spec.md`. `TelemetryEvent.can_id` is a required field, not optional, so every event can always be traced back to the exact message it came from. |
+| `TelemetryEvent` validates shape, not physical plausibility | E.g. a `battery_soc_pct` of 500 is rejected by nothing in Phase 1 — it's shaped correctly. Range/plausibility checks are deliberately left to the Edge Gateway (Phase 3), so Phase 4's out-of-range fault injection has real "structurally valid but physically wrong" data to test the gateway's defenses against. |
 
 ## 4. Target repository structure
 
-Built incrementally — each item is tagged with the phase that creates it:
+Built incrementally — each item is tagged with the phase that creates it.
+Items marked **done** exist in the repo today; everything else is still
+just the target destination.
 
 ```
 edge-to-cloud-automotive-telemetry-poc/
-├── README.md, .gitignore, requirements.txt, .env.example, ARCHITECTURE.md   [Phase 0]
+├── README.md, .gitignore, requirements.txt, .env.example, ARCHITECTURE.md   [Phase 0 — done]
+├── pytest.ini                                        [Phase 1 — done]
 ├── docs/
-│   ├── assumptions-and-limitations.md   [started Phase 0, appended every phase]
-│   ├── can-signal-spec.md               [Phase 1]
+│   ├── assumptions-and-limitations.md   [started Phase 0, appended every phase — done]
+│   ├── can-signal-spec.md               [Phase 1 — done]
 │   ├── uds-spec.md                      [Phase 2]
 │   └── aws-setup.md                     [Phase 5]
-├── common/                              [Phase 1 — shared schema package]
-│   ├── telemetry_schema.py              [Phase 1 — TelemetryEvent]
+├── common/                              [Phase 1 — shared schema package — done]
+│   ├── telemetry_schema.py              [Phase 1 — TelemetryEvent — done]
+│   ├── can_signal_map.py                [Phase 1 — 11-message CAN registry + encode/decode — done]
+│   ├── tests/                           [Phase 1 — done]
 │   ├── diagnostic_schema.py             [Phase 2 — DiagnosticEvent]
 │   └── operational_schema.py            [Phase 4/6 — buffer/metric events]
-├── simulation/                          [Phase 1: ecus/, can_bus.py, tests/]
+├── simulation/                          [Phase 1 — done]
+│   ├── can_bus.py                       [Phase 1 — virtual bus + send/run helpers — done]
+│   ├── ecus/                            [Phase 1 — powertrain/battery/body — done]
+│   ├── run_simulation.py                [Phase 1 — live demo entry point — done]
+│   ├── tests/                           [Phase 1 — done]
 │   └── uds/                             [Phase 2: uds_server.py, uds_client.py]
 ├── edge_gateway/                        [Phase 3: ingestion.py, validation.py, normalization.py, logging_config.py]
 │   ├── buffer.py, fault_injection.py    [Phase 4]
@@ -117,15 +132,15 @@ edge-to-cloud-automotive-telemetry-poc/
 ├── dashboard/                           [Phase 10: backend/ (REST+WebSocket), frontend/]
 ├── scenarios/resilience_demo.py         [Phase 8]
 ├── docker/docker-compose.yml            [Phase 3 — adds mosquitto; grows each phase]
-└── .github/workflows/ci.yml             [Phase 1 — minimal, grows every phase]
+└── .github/workflows/ci.yml             [Phase 1 — minimal, grows every phase — done]
 ```
 
 ## 5. Phase plan
 
 | Phase | Scope | New files/dirs created |
 |---|---|---|
-| 0 | Minimal scaffolding | `README.md`, `.gitignore`, `requirements.txt`, `.env.example`, `ARCHITECTURE.md` |
-| 1 | Vehicle simulation + shared schema foundation | `common/telemetry_schema.py`, `simulation/` (ecus, can_bus, tests), `docs/can-signal-spec.md`, first `.github/workflows/ci.yml` |
+| 0 | Minimal scaffolding — **done** | `README.md`, `.gitignore`, `requirements.txt`, `.env.example`, `ARCHITECTURE.md` |
+| 1 | Vehicle simulation + shared schema foundation — **done** | `common/telemetry_schema.py`, `common/can_signal_map.py`, `common/tests/`, `simulation/can_bus.py`, `simulation/ecus/` (3 ECUs), `simulation/run_simulation.py`, `simulation/tests/`, `docs/can-signal-spec.md`, `pytest.ini`, `.github/workflows/ci.yml` |
 | 2 | UDS diagnostics | `simulation/uds/`, `common/diagnostic_schema.py`, `docs/uds-spec.md` |
 | 3 | Edge Gateway core | `edge_gateway/` (ingestion, validation, normalization, logging), `docker/docker-compose.yml` (local Mosquitto) |
 | 4 | Buffering, retry, fault injection | `edge_gateway/buffer.py`, `fault_injection.py`, `common/operational_schema.py` if needed |
