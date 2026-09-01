@@ -39,6 +39,18 @@ class PowertrainECU:
         self._rpm = 800.0
         self._throttle_pct = 0.0
 
+    @property
+    def speed_kph(self) -> float:
+        """Current live speed, for the Phase 2 UDS server to expose over
+        DID 0x1001. Read-only: only `tick()` may change ECU state."""
+        return self._speed_kph
+
+    @property
+    def rpm(self) -> float:
+        """Current live RPM, for the Phase 2 UDS server to expose over
+        DID 0x1002."""
+        return self._rpm
+
     def tick(self) -> List[TelemetryEvent]:
         """Advance the simulated state by one step and return the 3 readings."""
         self._throttle_pct = self._drift(self._throttle_pct, step=5.0, low=0.0, high=100.0)

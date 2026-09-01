@@ -1,9 +1,9 @@
 # Architecture & Phase Plan
 
-Status: plan approved. Implementation proceeds phase by phase; each phase
-is reviewed before the next begins. This document is the single source of
-truth for *why* the system is shaped the way it is — update it whenever a
-phase changes or adds a decision.
+Status: Phase 2 complete. Implementation proceeds phase by phase; each
+phase is reviewed before the next begins. This document is the single
+source of truth for *why* the system is shaped the way it is — update it
+whenever a phase changes or adds a decision.
 
 ## 1. Scope & framing
 
@@ -46,6 +46,15 @@ real inter-process transport. So the 3 ECUs are 3 separate Python classes
 running as threads inside one process, not 3 separate OS processes as an
 earlier draft of this diagram implied. This doesn't change any decision
 above; it's simply the accurate mechanics of the tool we chose.
+
+**Confirmed during Phase 2 planning (smoke test before implementation):**
+`udsoncan` (1.26.1) is a client-side-only library with no server
+implementation, so `simulation/uds/uds_server.py` is hand-rolled on top of
+its `Request`/`Response` byte-level classes. The ISO-TP library's PyPI
+package is named `can-isotp` (2.0.7) even though the importable module is
+`isotp`. Once `isotp.CanStack.start()` is called it runs its own
+background I/O threads; the older poll-driven `.process()` API must not
+be called afterward. See `docs/uds-spec.md` for the full write-up.
 
 ### Component responsibilities
 
@@ -95,6 +104,9 @@ above; it's simply the accurate mechanics of the tool we chose.
 | `TelemetryEvent` schemas built with Pydantic | Decided at Phase 1: validation (types, required fields, known enum values) and serialization come built-in, which is directly useful since "validate" is a named Edge Gateway responsibility. The trade-off (one more dependency, some implicit behavior) was accepted over hand-written dataclass validation. |
 | A CAN ID identifies a message, not an ECU | Corrected during Phase 1 planning: one logical ECU can own several CAN IDs. This vehicle's 3 ECUs own 11 CAN messages between them (3 + 4 + 4) — see `docs/can-signal-spec.md`. `TelemetryEvent.can_id` is a required field, not optional, so every event can always be traced back to the exact message it came from. |
 | `TelemetryEvent` validates shape, not physical plausibility | E.g. a `battery_soc_pct` of 500 is rejected by nothing in Phase 1 — it's shaped correctly. Range/plausibility checks are deliberately left to the Edge Gateway (Phase 3), so Phase 4's out-of-range fault injection has real "structurally valid but physically wrong" data to test the gateway's defenses against. |
+| `vehicle_id` and the UDS VIN are two separate constants | Decided during Phase 2 approval: `DEFAULT_VEHICLE_ID` (this project's own simulated-vehicle identifier, used on every event) and `DEFAULT_SIMULATED_VIN` (a synthetic value returned only by UDS DID `0xF190`) are unrelated by design. Prevents conflating this project's internal ID with a UDS-standard field, and makes clear the VIN is fabricated for the POC, not a real vehicle VIN. |
+| UDS server is hand-rolled, not from a library | `udsoncan` only implements the client side of UDS; there is no server counterpart to depend on. `simulation/uds/uds_server.py` builds directly on `udsoncan.Request`/`Response` for parsing/building UDS byte payloads rather than reimplementing that framing from scratch. |
+| UDS session tracking without access-control enforcement | Phase 2 tracks which diagnostic session is active but does not yet gate any service behind it. Enforcing this now would add a rule with no corresponding test scenario; deferred to a later phase if needed. |
 
 ## 4. Target repository structure
 
@@ -109,20 +121,20 @@ edge-to-cloud-automotive-telemetry-poc/
 ├── docs/
 │   ├── assumptions-and-limitations.md   [started Phase 0, appended every phase — done]
 │   ├── can-signal-spec.md               [Phase 1 — done]
-│   ├── uds-spec.md                      [Phase 2]
+│   ├── uds-spec.md                      [Phase 2 — done]
 │   └── aws-setup.md                     [Phase 5]
 ├── common/                              [Phase 1 — shared schema package — done]
 │   ├── telemetry_schema.py              [Phase 1 — TelemetryEvent — done]
 │   ├── can_signal_map.py                [Phase 1 — 11-message CAN registry + encode/decode — done]
-│   ├── tests/                           [Phase 1 — done]
-│   ├── diagnostic_schema.py             [Phase 2 — DiagnosticEvent]
+│   ├── diagnostic_schema.py             [Phase 2 — DiagnosticEvent — done]
+│   ├── tests/                           [Phase 1, extended Phase 2 — done]
 │   └── operational_schema.py            [Phase 4/6 — buffer/metric events]
 ├── simulation/                          [Phase 1 — done]
 │   ├── can_bus.py                       [Phase 1 — virtual bus + send/run helpers — done]
 │   ├── ecus/                            [Phase 1 — powertrain/battery/body — done]
 │   ├── run_simulation.py                [Phase 1 — live demo entry point — done]
 │   ├── tests/                           [Phase 1 — done]
-│   └── uds/                             [Phase 2: uds_server.py, uds_client.py]
+│   └── uds/                             [Phase 2 — uds_server.py, uds_client.py, tests/ — done]
 ├── edge_gateway/                        [Phase 3: ingestion.py, validation.py, normalization.py, logging_config.py]
 │   ├── buffer.py, fault_injection.py    [Phase 4]
 │   ├── cloud_publisher.py (TLS/IoT Core)[Phase 5]
@@ -141,7 +153,7 @@ edge-to-cloud-automotive-telemetry-poc/
 |---|---|---|
 | 0 | Minimal scaffolding — **done** | `README.md`, `.gitignore`, `requirements.txt`, `.env.example`, `ARCHITECTURE.md` |
 | 1 | Vehicle simulation + shared schema foundation — **done** | `common/telemetry_schema.py`, `common/can_signal_map.py`, `common/tests/`, `simulation/can_bus.py`, `simulation/ecus/` (3 ECUs), `simulation/run_simulation.py`, `simulation/tests/`, `docs/can-signal-spec.md`, `pytest.ini`, `.github/workflows/ci.yml` |
-| 2 | UDS diagnostics | `simulation/uds/`, `common/diagnostic_schema.py`, `docs/uds-spec.md` |
+| 2 | UDS diagnostics — **done** | `simulation/uds/`, `common/diagnostic_schema.py`, `docs/uds-spec.md` |
 | 3 | Edge Gateway core | `edge_gateway/` (ingestion, validation, normalization, logging), `docker/docker-compose.yml` (local Mosquitto) |
 | 4 | Buffering, retry, fault injection | `edge_gateway/buffer.py`, `fault_injection.py`, `common/operational_schema.py` if needed |
 | 5 | AWS integration | `infra/` (Terraform), `edge_gateway/cloud_publisher.py`, `docs/aws-setup.md` |

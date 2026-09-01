@@ -55,4 +55,31 @@ introduces a simplification worth being explicit about.
   (bounded drift within each signal's valid range), not sampled from any
   real vehicle dataset — realistic-looking, not real.
 
+## Assumptions and limitations added in Phase 2
+
+- Only the Powertrain ECU hosts a UDS server. A real vehicle would have
+  one per ECU; this project simulates one to demonstrate the pattern
+  without triplicating the same server logic for no added teaching value.
+- `udsoncan` provides UDS vocabulary/encoding and a client only -- it has
+  no server implementation. `simulation/uds/uds_server.py` is a hand-rolled
+  server built on `udsoncan.Request`/`udsoncan.Response` for byte-level
+  parsing/building, not a library-provided server.
+- Diagnostic sessions (`0x10`) are tracked but not enforced: no service is
+  gated behind having entered `extendedDiagnosticSession`. A real ECU
+  commonly restricts certain DIDs/services to non-default sessions.
+- `0x19 reportDTCByStatusMask` always returns the same static 2-DTC list;
+  the client's requested status mask is accepted but not used to filter.
+- DTC encoding is illustrative, not certified: the 3-byte hex values are
+  not guaranteed to match the real SAE J2012 bit-level layout for the
+  corresponding P-codes.
+- `vehicle_id` (`DEFAULT_VEHICLE_ID`) and the UDS VIN
+  (`DEFAULT_SIMULATED_VIN`, DID `0xF190`) are two separate, unrelated
+  constants by design -- see docs/uds-spec.md. The VIN is entirely
+  synthetic and not derived from any real vehicle or from `vehicle_id`.
+- The two project-invented DIDs (`0x1001` speed, `0x1002` RPM) read live
+  state directly from the running `PowertrainECU` instance's read-only
+  properties, not by decoding the ECU's own CAN telemetry output -- this
+  mirrors how a real ECU's diagnostic layer has direct access to its own
+  internal state rather than sniffing its own bus traffic.
+
 Further entries are added as each phase is implemented.

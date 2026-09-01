@@ -37,10 +37,12 @@ phase reviewed before the next begins. See [ARCHITECTURE.md](ARCHITECTURE.md)
 for the full architecture, the phase plan, and the reasoning behind every
 major technical decision.
 
-**Current status: Phase 1 complete** — a simulated 3-ECU vehicle network
-publishes realistic telemetry over a virtual CAN bus, and a shared
-`TelemetryEvent` schema (`common/`) is in place for every later component
-to reuse. No Edge Gateway, UDS, cloud, or dashboard code exists yet.
+**Current status: Phase 2 complete** — in addition to Phase 1's simulated
+3-ECU vehicle network, the Powertrain ECU now also hosts a basic UDS
+(ISO 14229) diagnostic server, reachable by a UDS client/tester over the
+same virtual CAN bus via ISO-TP. A shared `DiagnosticEvent` schema
+(`common/`) captures every diagnostic request/response transaction. No
+Edge Gateway, cloud, or dashboard code exists yet.
 
 ## Requirements
 
@@ -68,5 +70,8 @@ python -m simulation.run_simulation --duration 5 --seed 42 --verbose
 
 There is no cloud, gateway, or dashboard to run yet — those arrive in
 later phases. See [ARCHITECTURE.md](ARCHITECTURE.md) for the full phase
-plan and [docs/can-signal-spec.md](docs/can-signal-spec.md) for exactly
-what the simulated vehicle transmits.
+plan, [docs/can-signal-spec.md](docs/can-signal-spec.md) for exactly what
+the simulated vehicle transmits, and
+[docs/uds-spec.md](docs/uds-spec.md) for the UDS diagnostic services the
+Powertrain ECU now supports (`pytest simulation/uds/` runs a full
+client/server UDS exchange over the virtual CAN bus).

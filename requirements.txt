@@ -9,6 +9,12 @@ python-can==4.6.1      # virtual CAN bus for the simulated ECUs
 pydantic==2.13.3        # TelemetryEvent schema validation
 pytest==9.1.1           # test runner
 
+# --- Phase 2: UDS diagnostics ---
+udsoncan==1.26.1        # UDS request/response vocabulary, client, encoding (client-only; no server)
+can-isotp==2.0.7        # ISO-TP (ISO 15765-2) segmentation over the same virtual CAN bus
+                        # NOTE: the importable module is `isotp`, but the PyPI package
+                        # name is `can-isotp` -- there is no PyPI package literally named `isotp`.
+
 # Expected future additions (not yet installed):
 #   Phase 3 - paho-mqtt
 #   Phase 9 - anthropic
