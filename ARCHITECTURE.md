@@ -1,6 +1,6 @@
 # Architecture & Phase Plan
 
-Status: Phase 2 complete. Implementation proceeds phase by phase; each
+Status: Phase 3 complete. Implementation proceeds phase by phase; each
 phase is reviewed before the next begins. This document is the single
 source of truth for *why* the system is shaped the way it is — update it
 whenever a phase changes or adds a decision.
@@ -56,6 +56,15 @@ package is named `can-isotp` (2.0.7) even though the importable module is
 background I/O threads; the older poll-driven `.process()` API must not
 be called afterward. See `docs/uds-spec.md` for the full write-up.
 
+**Confirmed during Phase 3 planning (smoke test before implementation):**
+`paho-mqtt` 2.1.0 deprecated its old default callback signatures;
+`mqtt.Client(...)` must be constructed with
+`callback_api_version=CallbackAPIVersion.VERSION2` explicitly. Verified
+live against a real local Mosquitto broker (2.0.18, installed via
+`apt-get` since this project's sandbox has no usable Docker daemon —
+`docker/docker-compose.yml` remains the deployment artifact for a
+developer's own machine or CI). See `docs/edge-gateway-spec.md`.
+
 ### Component responsibilities
 
 - **Simulated ECUs** — 3 logical ECUs (Powertrain, Battery/Energy,
@@ -107,6 +116,11 @@ be called afterward. See `docs/uds-spec.md` for the full write-up.
 | `vehicle_id` and the UDS VIN are two separate constants | Decided during Phase 2 approval: `DEFAULT_VEHICLE_ID` (this project's own simulated-vehicle identifier, used on every event) and `DEFAULT_SIMULATED_VIN` (a synthetic value returned only by UDS DID `0xF190`) are unrelated by design. Prevents conflating this project's internal ID with a UDS-standard field, and makes clear the VIN is fabricated for the POC, not a real vehicle VIN. |
 | UDS server is hand-rolled, not from a library | `udsoncan` only implements the client side of UDS; there is no server counterpart to depend on. `simulation/uds/uds_server.py` builds directly on `udsoncan.Request`/`Response` for parsing/building UDS byte payloads rather than reimplementing that framing from scratch. |
 | UDS session tracking without access-control enforcement | Phase 2 tracks which diagnostic session is active but does not yet gate any service behind it. Enforcing this now would add a rule with no corresponding test scenario; deferred to a later phase if needed. |
+| Edge Gateway runs in the same process as the ECUs | `python-can`'s virtual bus is process-local (Phase 1 finding), so `run_demo.py` starts the gateway and the 3 ECU threads together. The gateway remains a logically distinct component (own package/thread/session_id) reachable only via CAN frames on the shared bus, never direct object access — a simulation-environment constraint, not an architectural merge. |
+| `session_id` moved from simulator-owned to gateway-owned | Raw CAN frames never carried a session concept — only `can_id` and 8 data bytes exist on the wire. Now that a real listener (the gateway) exists, it mints its own `session_id` per run and attaches it during decode, matching how a real edge component owns correlation context rather than the sensors themselves. |
+| Gateway validation rejects, not flags | An out-of-range decoded value (e.g. `battery_soc_pct=500`) is dropped and logged, not forwarded with a warning marker — gives Phase 4's fault injection a clean pass/fail signal, and keeps "what got published" trustworthy by construction. |
+| MQTT topic scheme: `vehicle/{vehicle_id}/telemetry/{source_ecu}/{signal_name}` | Standard MQTT/IoT topic-hierarchy practice — lets a subscriber filter by vehicle, ECU, or specific signal without inspecting every payload. Payload is `TelemetryEvent`'s own JSON, no new schema introduced. |
+| Real-broker integration tests spawn `mosquitto` via subprocess, not Docker | This sandbox (and possibly some CI runners) can't rely on a working Docker daemon; `apt-get install mosquitto` reliably provides the binary. `docker/docker-compose.yml` remains the setup for manual/demo use on a developer's own machine. |
 
 ## 4. Target repository structure
 
@@ -122,6 +136,7 @@ edge-to-cloud-automotive-telemetry-poc/
 │   ├── assumptions-and-limitations.md   [started Phase 0, appended every phase — done]
 │   ├── can-signal-spec.md               [Phase 1 — done]
 │   ├── uds-spec.md                      [Phase 2 — done]
+│   ├── edge-gateway-spec.md             [Phase 3 — done]
 │   └── aws-setup.md                     [Phase 5]
 ├── common/                              [Phase 1 — shared schema package — done]
 │   ├── telemetry_schema.py              [Phase 1 — TelemetryEvent — done]
@@ -135,7 +150,9 @@ edge-to-cloud-automotive-telemetry-poc/
 │   ├── run_simulation.py                [Phase 1 — live demo entry point — done]
 │   ├── tests/                           [Phase 1 — done]
 │   └── uds/                             [Phase 2 — uds_server.py, uds_client.py, tests/ — done]
-├── edge_gateway/                        [Phase 3: ingestion.py, validation.py, normalization.py, logging_config.py]
+├── edge_gateway/                        [Phase 3 — done]
+│   ├── ingestion.py, validation.py, normalization.py, mqtt_publisher.py, logging_config.py, gateway.py [Phase 3 — done]
+│   ├── tests/                           [Phase 3 — unit + real-broker integration — done]
 │   ├── buffer.py, fault_injection.py    [Phase 4]
 │   ├── cloud_publisher.py (TLS/IoT Core)[Phase 5]
 │   └── metrics.py                       [Phase 6]
@@ -143,7 +160,8 @@ edge-to-cloud-automotive-telemetry-poc/
 ├── analyzer/                            [Phase 9: rules_engine.py, llm_analyzer.py, prompts/]
 ├── dashboard/                           [Phase 10: backend/ (REST+WebSocket), frontend/]
 ├── scenarios/resilience_demo.py         [Phase 8]
-├── docker/docker-compose.yml            [Phase 3 — adds mosquitto; grows each phase]
+├── run_demo.py                          [Phase 3 — ECUs + gateway together — done]
+├── docker/docker-compose.yml            [Phase 3 — local Mosquitto — done; grows each phase]
 └── .github/workflows/ci.yml             [Phase 1 — minimal, grows every phase — done]
 ```
 
@@ -154,7 +172,7 @@ edge-to-cloud-automotive-telemetry-poc/
 | 0 | Minimal scaffolding — **done** | `README.md`, `.gitignore`, `requirements.txt`, `.env.example`, `ARCHITECTURE.md` |
 | 1 | Vehicle simulation + shared schema foundation — **done** | `common/telemetry_schema.py`, `common/can_signal_map.py`, `common/tests/`, `simulation/can_bus.py`, `simulation/ecus/` (3 ECUs), `simulation/run_simulation.py`, `simulation/tests/`, `docs/can-signal-spec.md`, `pytest.ini`, `.github/workflows/ci.yml` |
 | 2 | UDS diagnostics — **done** | `simulation/uds/`, `common/diagnostic_schema.py`, `docs/uds-spec.md` |
-| 3 | Edge Gateway core | `edge_gateway/` (ingestion, validation, normalization, logging), `docker/docker-compose.yml` (local Mosquitto) |
+| 3 | Edge Gateway core — **done** | `edge_gateway/` (ingestion, validation, normalization, mqtt_publisher, logging, gateway), `run_demo.py`, `docker/docker-compose.yml` (local Mosquitto), `docs/edge-gateway-spec.md` |
 | 4 | Buffering, retry, fault injection | `edge_gateway/buffer.py`, `fault_injection.py`, `common/operational_schema.py` if needed |
 | 5 | AWS integration | `infra/` (Terraform), `edge_gateway/cloud_publisher.py`, `docs/aws-setup.md` |
 | 6 | Observability | `edge_gateway/metrics.py`, correlation IDs finalized end-to-end |

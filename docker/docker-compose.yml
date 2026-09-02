@@ -1,0 +1,17 @@
+# Phase 3: a local Mosquitto broker for manual/demo use (run_demo.py) and
+# for developers who prefer Docker over installing mosquitto directly.
+# The automated test suite does NOT depend on this file -- see
+# edge_gateway/tests/conftest.py for why it launches its own mosquitto
+# subprocess instead (this environment's sandbox and CI runners aren't
+# guaranteed to have a usable Docker daemon, but they can apt-get install
+# the mosquitto binary directly).
+#
+# Usage: docker compose -f docker/docker-compose.yml up
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2
+    ports:
+      - "1883:1883"
+    volumes:
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+    restart: unless-stopped

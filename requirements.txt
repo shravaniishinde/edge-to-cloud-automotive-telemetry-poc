@@ -15,7 +15,15 @@ can-isotp==2.0.7        # ISO-TP (ISO 15765-2) segmentation over the same virtua
                         # NOTE: the importable module is `isotp`, but the PyPI package
                         # name is `can-isotp` -- there is no PyPI package literally named `isotp`.
 
+# --- Phase 3: Edge Gateway core (ingest/validate/normalize/publish) ---
+paho-mqtt==2.1.0        # MQTT client for publishing to local Mosquitto (and AWS IoT Core from Phase 5)
+                        # NOTE: v2.x requires passing CallbackAPIVersion.VERSION2 explicitly to
+                        # Client() -- confirmed via smoke test; the old default (VERSION1) still
+                        # works but is deprecated.
+# The Mosquitto BROKER itself is not a pip package -- it's installed via apt
+# (`apt-get install mosquitto`) for local test runs, or run via
+# docker/docker-compose.yml (eclipse-mosquitto:2 image) for manual/demo use.
+
 # Expected future additions (not yet installed):
-#   Phase 3 - paho-mqtt
 #   Phase 9 - anthropic
 #   Phase 10 - fastapi, uvicorn (dashboard backend) - to be confirmed at that phase

@@ -37,19 +37,23 @@ phase reviewed before the next begins. See [ARCHITECTURE.md](ARCHITECTURE.md)
 for the full architecture, the phase plan, and the reasoning behind every
 major technical decision.
 
-**Current status: Phase 2 complete** — in addition to Phase 1's simulated
-3-ECU vehicle network, the Powertrain ECU now also hosts a basic UDS
-(ISO 14229) diagnostic server, reachable by a UDS client/tester over the
-same virtual CAN bus via ISO-TP. A shared `DiagnosticEvent` schema
-(`common/`) captures every diagnostic request/response transaction. No
-Edge Gateway, cloud, or dashboard code exists yet.
+**Current status: Phase 3 complete** — an Edge Gateway now listens on the
+same virtual CAN bus, decodes and validates telemetry (rejecting
+physically implausible readings), and publishes it to a local MQTT
+broker with structured, session-correlated logging. Combined with Phase
+1's simulated 3-ECU network and Phase 2's UDS diagnostic server, the
+system now runs a full local edge-to-broker pipeline. No cloud (AWS IoT
+Core) or dashboard code exists yet.
 
 ## Requirements
 
 This list grows as each phase introduces a real dependency:
 
 - Python 3.11 (see `requirements.txt` for pinned package versions)
-- Docker & Docker Compose (introduced in Phase 3)
+- A local MQTT broker: either `docker compose -f docker/docker-compose.yml up`
+  (Docker & Docker Compose), or install `mosquitto` directly
+  (`apt-get install mosquitto` on Debian/Ubuntu) and run it with
+  `docker/mosquitto/mosquitto.conf`
 - An AWS account (introduced in Phase 5; all resources are provisioned via
   Terraform and designed to be torn down cleanly after use)
 
@@ -68,10 +72,24 @@ python -m simulation.run_simulation --duration 5 --seed 42
 python -m simulation.run_simulation --duration 5 --seed 42 --verbose
 ```
 
-There is no cloud, gateway, or dashboard to run yet — those arrive in
-later phases. See [ARCHITECTURE.md](ARCHITECTURE.md) for the full phase
-plan, [docs/can-signal-spec.md](docs/can-signal-spec.md) for exactly what
-the simulated vehicle transmits, and
-[docs/uds-spec.md](docs/uds-spec.md) for the UDS diagnostic services the
-Powertrain ECU now supports (`pytest simulation/uds/` runs a full
-client/server UDS exchange over the virtual CAN bus).
+To see the Edge Gateway itself running against a real broker (rather than
+just its tests), start a local Mosquitto broker (see above), then:
+
+```bash
+python run_demo.py --duration 10
+```
+
+This starts all 3 ECUs and the Edge Gateway together (they must share one
+Python process — see [docs/edge-gateway-spec.md](docs/edge-gateway-spec.md)
+for why) and publishes validated telemetry to
+`vehicle/SIM-VEHICLE-01/telemetry/{ecu}/{signal}` topics on the broker.
+Subscribe with `mosquitto_sub -t 'vehicle/#'` in another terminal to watch
+it live.
+
+There is no cloud or dashboard to run yet — those arrive in later phases.
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the full phase plan,
+[docs/can-signal-spec.md](docs/can-signal-spec.md) for exactly what the
+simulated vehicle transmits, [docs/uds-spec.md](docs/uds-spec.md) for the
+UDS diagnostic services the Powertrain ECU supports, and
+[docs/edge-gateway-spec.md](docs/edge-gateway-spec.md) for the Edge
+Gateway's ingest/validate/normalize/publish pipeline.
