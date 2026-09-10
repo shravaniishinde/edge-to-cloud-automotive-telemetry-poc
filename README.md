@@ -37,13 +37,18 @@ phase reviewed before the next begins. See [ARCHITECTURE.md](ARCHITECTURE.md)
 for the full architecture, the phase plan, and the reasoning behind every
 major technical decision.
 
-**Current status: Phase 3 complete** — an Edge Gateway now listens on the
-same virtual CAN bus, decodes and validates telemetry (rejecting
-physically implausible readings), and publishes it to a local MQTT
-broker with structured, session-correlated logging. Combined with Phase
-1's simulated 3-ECU network and Phase 2's UDS diagnostic server, the
-system now runs a full local edge-to-broker pipeline. No cloud (AWS IoT
-Core) or dashboard code exists yet.
+**Current status: Phase 5 complete** — the Edge Gateway can now publish
+the exact same telemetry to a real AWS IoT Core endpoint over MQTT/TLS,
+in addition to local Mosquitto. Nothing about Phase 4's resilience story
+changed to make this possible: a failed publish is still buffered to a
+persistent local SQLite queue, the gateway still keeps ingesting and
+validating CAN traffic through an outage, and it still reconnects
+(exponential backoff, capped at 30s, no background thread) and replays
+everything buffered, in order, once the broker — local or AWS — comes
+back. Combined with Phase 1's simulated 3-ECU network, Phase 2's UDS
+diagnostic server, and Phase 3's ingest/validate/normalize/publish
+pipeline, the system now demonstrates a resilient edge-to-cloud pipeline
+end to end. No dashboard code exists yet.
 
 ## Requirements
 
@@ -54,8 +59,10 @@ This list grows as each phase introduces a real dependency:
   (Docker & Docker Compose), or install `mosquitto` directly
   (`apt-get install mosquitto` on Debian/Ubuntu) and run it with
   `docker/mosquitto/mosquitto.conf`
-- An AWS account (introduced in Phase 5; all resources are provisioned via
-  Terraform and designed to be torn down cleanly after use)
+- An AWS account, only if you want to run against AWS IoT Core instead of
+  local Mosquitto (Phase 5; all resources are provisioned via Terraform
+  and designed to be torn down cleanly after use — see
+  [docs/aws-setup.md](docs/aws-setup.md))
 
 ## Getting started
 
@@ -86,8 +93,45 @@ for why) and publishes validated telemetry to
 Subscribe with `mosquitto_sub -t 'vehicle/#'` in another terminal to watch
 it live.
 
-There is no cloud or dashboard to run yet — those arrive in later phases.
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the full phase plan,
+To see Phase 4's resilience story — buffering through an outage, then
+replaying on recovery — while the demo above is running, in a second
+terminal:
+
+```bash
+docker compose -f docker/docker-compose.yml stop mosquitto
+# watch the demo's logs shift from "published telemetry event" to
+# "publish failed -- buffered for replay"
+
+docker compose -f docker/docker-compose.yml start mosquitto
+# watch the logs show "MQTT reconnected" followed by a burst of
+# "replayed buffered events", and mosquitto_sub receive that same burst
+# in original order
+```
+
+## Cloud (AWS IoT Core)
+
+Local Mosquitto is still the default — nothing above changes. To publish
+the same telemetry to a real AWS IoT Core endpoint instead:
+
+1. Provision AWS IoT Core with Terraform and set four environment
+   variables it prints (`AWS_IOT_ENDPOINT`, `AWS_IOT_CA_PATH`,
+   `AWS_IOT_CERT_PATH`, `AWS_IOT_KEY_PATH`) — see
+   [docs/aws-setup.md](docs/aws-setup.md) for the exact steps.
+2. Run `python run_demo.py` exactly as before. With all four variables
+   set, it connects to AWS IoT Core over MQTT/TLS instead of local
+   Mosquitto; with none set, it's unchanged. Setting only *some* of them
+   is treated as a configuration error and the gateway refuses to
+   start — it never silently falls back to local Mosquitto.
+
+The same topic scheme and JSON payload are used either way; only the
+broker and its TLS/authentication differ. See
+[docs/edge-gateway-spec.md](docs/edge-gateway-spec.md)'s "Publishing to
+AWS IoT Core" section for how the gateway decides which broker to use,
+and [ARCHITECTURE.md](ARCHITECTURE.md) for why Kinesis is deliberately
+not part of this phase.
+
+There is no dashboard to run yet — that arrives in a later phase. See
+[ARCHITECTURE.md](ARCHITECTURE.md) for the full phase plan,
 [docs/can-signal-spec.md](docs/can-signal-spec.md) for exactly what the
 simulated vehicle transmits, [docs/uds-spec.md](docs/uds-spec.md) for the
 UDS diagnostic services the Powertrain ECU supports, and

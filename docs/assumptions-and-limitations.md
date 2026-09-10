@@ -115,11 +115,113 @@ introduces a simplification worth being explicit about.
   Phase 6 adds a real metrics system.
 - Phase 2's UDS diagnostic events are not ingested, validated, or
   published by the gateway. UDS remains a standalone client/server demo.
-- The automated test suite's real-broker integration test launches its
-  own `mosquitto` subprocess (via `apt-get install mosquitto`) rather
-  than depending on Docker, since this project's sandbox (and possibly
-  some CI runners) cannot rely on a working Docker daemon.
-  `docker/docker-compose.yml` remains the setup for manual/demo use on a
-  developer's own machine.
+- The automated test suite's real-broker integration tests connect to an
+  already-running broker (`localhost:1883` by default, overridable via
+  `MQTT_BROKER_HOST`/`MQTT_BROKER_PORT`) rather than spawning one
+  themselves. `docker/docker-compose.yml` provides that broker for local
+  development and manual demo use; CI provides an equivalent broker by
+  installing the `mosquitto` package directly (which starts it as a
+  systemd service), since GitHub-hosted runners don't guarantee a
+  working Docker daemon.
+
+## Assumptions and limitations added in Phase 4
+
+- Delivery is **at least once, not exactly once**. A row is only removed
+  from the buffer after `MqttPublisher.publish()` reports the broker
+  actually acknowledged it (a real QoS-1 PUBACK, confirmed by reading
+  paho-mqtt 2.1.0's own source -- see docs/edge-gateway-spec.md). If the
+  process crashes in the narrow window between that acknowledgement and
+  the buffer row being deleted, the same event could be replayed again
+  on the next run. This gap is accepted, not solved -- closing it
+  completely would need a transactional publish+delete across two
+  separate systems (the broker and SQLite), which is real complexity
+  this POC doesn't need to demonstrate the resilience story.
+- The buffer is capped at `DEFAULT_MAX_BUFFERED_EVENTS = 5000` rows (a
+  constructor parameter, not hardcoded) -- roughly minutes-to-tens-of-
+  minutes of outage coverage at this simulation's combined ECU rate, not
+  an attempt to survive a real multi-hour outage. Once full, the oldest
+  buffered event is dropped to make room for the newest, logged and
+  counted (`TelemetryBuffer.dropped_count`) rather than silently lost.
+- Reconnect attempts are paced by `EdgeGateway.run_once()`'s own loop,
+  not a dedicated background thread. `try_reconnect()` is a cheap
+  timestamp check on every iteration and only actually touches the
+  network once its exponential backoff window (1s, doubling, capped at
+  30s) has elapsed -- so reconnect timing has the same granularity as
+  `run_once()`'s own cadence (bounded by `BUS_RECV_TIMEOUT_SECONDS`,
+  0.5s), not sub-tick precision.
+- `TelemetryBuffer` opens its SQLite connection with
+  `check_same_thread=False`, because `run_demo.py` constructs the buffer
+  on the main thread while `EdgeGateway.run()` (which does all the
+  enqueue/replay work) executes on its own dedicated thread. Only one
+  thread ever actively uses the connection at a given moment; this
+  disables sqlite3's same-thread-origin check, it does not add real
+  concurrent access. Found by an actual crash during this phase's own
+  `run_demo.py` verification, not anticipated up front -- see the git
+  history for `edge_gateway/buffer.py`.
+- Fault injection (`edge_gateway/fault_injection.py`) is four small,
+  named, deterministic scenarios, not a randomized chaos framework:
+  forcing publish failures for a fixed count (no real network or Docker
+  involved), plus builders for a malformed frame and an out-of-range
+  frame that reuse `ingestion.py`/`validation.py`'s existing rejection
+  paths rather than adding new gateway logic for cases already handled.
+  The demo's actual broker-outage scenario uses a real
+  `docker compose stop mosquitto` -- Docker Compose is already this
+  project's one broker mechanism, so there's no need to fake that one.
+- No metrics are persisted or exported yet -- `buffered_count`,
+  `replayed_count`, and `TelemetryBuffer.dropped_count` are still plain
+  in-memory counters for this run's own summary log line, same as
+  Phase 3's counters. A real metrics system is still Phase 6.
+
+## Assumptions and limitations added in Phase 5
+
+- Kinesis is deliberately **not** provisioned or wired up in this phase.
+  CloudWatch Logs is the only IoT Rule destination -- sufficient to prove
+  telemetry reached AWS, which is this phase's actual job. If a
+  multi-consumer streaming story is ever justified (e.g. the dashboard
+  and the analyzer both needing to tail live telemetry independently),
+  it's a second IoT Rule action added in `infra/iot_rule.tf`, not an
+  Edge Gateway code change -- see `ARCHITECTURE.md`'s decision table.
+- AWS configuration is intentionally all-or-nothing. Setting only some of
+  the four required `AWS_IOT_*` environment variables raises
+  `AwsIotConfigError` and refuses to start, rather than falling back to
+  local Mosquitto -- a silent fallback there would be a much more
+  confusing failure than a clear startup error. See
+  `edge_gateway/cloud_publisher.py`.
+- Config validation checks that each certificate file *exists*, not that
+  its *contents* are valid PEM data. A syntactically present but garbage
+  cert/key file passes `cloud_publisher.py`'s check and only fails later,
+  inside paho-mqtt's `tls_set()`/`connect()`, with a `ssl.SSLError`. This
+  boundary is accepted rather than duplicating PEM parsing here just to
+  produce a slightly earlier error.
+- The device certificate is generated by Terraform (`aws_iot_certificate`
+  with `active = true`, no CSR) rather than device-generated. This means
+  the private key exists, briefly, in Terraform's own process and state
+  -- an accepted simplification for a single-developer POC. A production
+  fleet would have each device generate its own key locally and submit
+  only a Certificate Signing Request, so the private key never leaves
+  that device. See `docs/aws-setup.md`'s "Dev vs. production" section.
+- `MqttPublisher` gained optional `tls_ca_certs`/`tls_certfile`/
+  `tls_keyfile` constructor arguments (all-or-nothing, else `ValueError`)
+  rather than a separate cloud-specific publisher class. `connect()`,
+  `publish()`, `try_reconnect()`, and all of Phase 4's buffering/backoff
+  logic are byte-for-byte unchanged; a caller that passes no TLS
+  arguments (every Phase 1-4 test, and local Mosquitto use) is
+  unaffected. This preserves "one publish implementation," the same
+  principle Phase 4's replay logic already relied on.
+- AWS (IAM) credentials used by Terraform to provision resources and the
+  X.509 device certificate the gateway uses at runtime are two separate,
+  non-overlapping things. The gateway process never sees, stores, or
+  needs an AWS access key. See `docs/aws-setup.md`'s opening section for
+  the full explanation.
+- No AWS SDK (boto3 or otherwise) was added as a dependency. AWS IoT
+  Core's device endpoint is plain MQTT over TLS, which the existing
+  `paho-mqtt` dependency (Phase 3) already speaks -- provisioning
+  (Terraform) and runtime publishing (paho-mqtt) are different concerns
+  with different tools, and the gateway itself needs only the latter.
+- The AWS smoke test (`test_aws_iot_integration.py`) skips unless real
+  AWS IoT configuration is present in the environment -- it never runs in
+  CI (no AWS credentials exist there) and never runs locally unless
+  you've actually provisioned AWS IoT Core via `infra/`. This mirrors
+  Phase 3/4's `mosquitto_broker` fixture skip pattern exactly.
 
 Further entries are added as each phase is implemented.

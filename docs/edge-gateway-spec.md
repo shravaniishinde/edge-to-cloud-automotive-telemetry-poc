@@ -145,14 +145,151 @@ against an actual Mosquitto instance -- publishing a valid frame,
 confirming an out-of-range frame is silently dropped, and confirming a
 UDS frame sharing the bus is ignored.
 
-`edge_gateway/tests/conftest.py`'s `mosquitto_broker` fixture launches
-`mosquitto` directly as a subprocess (not via Docker) on port `18830` (not
-the default `1883`, so it never collides with a broker a developer might
-already have running), and skips the tests that need it if the
-`mosquitto` binary isn't installed. This exists because this project's
-sandbox (and possibly some CI runners) can't rely on a working Docker
-daemon, but `apt-get install mosquitto` reliably provides the binary.
-`docker/docker-compose.yml` is the equivalent setup for a developer's own
-machine or manual demo use (`docker compose up`, then `python run_demo.py`)
--- same broker, same config concept, different launch mechanism; there is
-no second, competing Mosquitto configuration to keep in sync.
+`edge_gateway/tests/conftest.py`'s `mosquitto_broker` fixture connects to
+an already-running broker at `localhost:1883` by default (overridable via
+the `MQTT_BROKER_HOST` / `MQTT_BROKER_PORT` environment variables) rather
+than spawning one itself, and skips the tests that need it if nothing is
+listening there. `docker/docker-compose.yml` is the normal way to provide
+that broker -- for local development, manual demo use
+(`docker compose up`, then `python run_demo.py`), and CI alike, so there
+is exactly one broker-provisioning story, not two competing ones. CI's
+own `mosquitto` package install (`.github/workflows/ci.yml`) starts an
+equivalent broker via its systemd service instead of Docker, since
+GitHub-hosted runners don't guarantee a working Docker daemon -- same
+broker, same config concept, different launch mechanism.
+
+## Resilience (Phase 4)
+
+Phase 3 explicitly left a publish failure as "log it, drop it." Phase 4
+gives it a second chance instead, using three small, separately testable
+pieces: `edge_gateway/buffer.py` (a persistent queue), `mqtt_publisher.py`
+additions (knowing when the connection is actually down, and retrying it
+sanely), and `gateway.py` wiring them together.
+
+### Delivery guarantee, made explicit
+
+Before changing anything, Phase 4 first pinned down exactly what
+`MqttPublisher.publish()` returning `True` already meant, by reading
+paho-mqtt 2.1.0's own source rather than assuming: `True` only happens
+once `MQTTMessageInfo.is_published()` is true, which for QoS 1 (this
+project's `DEFAULT_QOS`) is only ever set by `Client._handle_pubackcomp()`
+-- i.e. a real PUBACK was received from the broker. `wait_for_publish()`
+does **not** raise when it times out; it just returns, leaving
+`is_published()` false if no PUBACK arrived. `publish()` already checked
+`is_published()` afterward rather than treating "no exception" as
+success, so this was correct before Phase 4 touched it and needed no
+logic change -- only making the guarantee explicit in the docstring,
+since Phase 4's buffer-removal rule depends on it being genuinely true.
+The upshot: this system is **at least once**, not exactly once -- a
+publish that the broker acknowledges is never silently lost, but a crash
+in the narrow window between that acknowledgement and this process
+deleting the buffered row could cause one re-send on the next run. That
+window is accepted, not hidden -- see
+`docs/assumptions-and-limitations.md`.
+
+### Buffer: SQLite, persistent, FIFO, bounded
+
+`TelemetryBuffer` (edge_gateway/buffer.py) is one SQLite table,
+`pending_telemetry(id, event_id, topic, payload, enqueued_at)`, opened
+against a real file (not `:memory:`) so it survives a gateway process
+restart. `id` is an `AUTOINCREMENT` primary key, which is what makes
+`peek_batch()` (`ORDER BY id ASC`) a genuine, gap-free FIFO read. A
+publish failure calls `buffer.enqueue()` instead of just logging; nothing
+is ever silently dropped on a failed live publish.
+
+The buffer is capped (`DEFAULT_MAX_BUFFERED_EVENTS = 5000`, roughly
+minutes-to-tens-of-minutes of outage coverage at this simulation's
+combined ECU rate -- the right scale for a demo POC, not a real
+multi-hour outage). When full, `enqueue()` drops the *oldest* row to make
+room for the newest, logs a warning, and increments
+`TelemetryBuffer.dropped_count` -- the most recent vehicle state is
+judged more valuable to eventually deliver than a stale one from minutes
+ago.
+
+### Reconnect: no background thread, exponential backoff capped at 30s
+
+`MqttPublisher` now registers paho-mqtt's `on_disconnect` callback, which
+is the one thing Phase 3 never had: a way to notice a connection that
+dropped *after* `connect()` succeeded (before Phase 4, `_connected` was
+only ever set in `connect()`/`disconnect()`). `try_reconnect()` is a
+single bounded attempt gated by a `time.monotonic()` deadline: if it's
+not yet time to retry, it returns immediately without touching the
+network at all, which is what keeps this from becoming a tight
+reconnect loop. On failure the backoff doubles (starting at 1s, capped
+at 30s); on success it resets. There is deliberately no dedicated
+background thread driving this -- `EdgeGateway.run_once()` calls
+`try_reconnect()` once per iteration of its own existing loop (checked
+every tick regardless of whether a CAN frame arrived, so retries aren't
+tied to bus traffic continuing), so the gateway's own natural cadence
+paces the retries instead.
+
+### Replay: same publish path, strict order, remove-only-on-confirmation
+
+`EdgeGateway._replay_buffered()` runs the instant `try_reconnect()`
+reports success. It reads a batch in `id` order and publishes each row
+through the exact same `MqttPublisher.publish()` call live telemetry
+uses -- there is one publish implementation, not two. A row is deleted
+only after `publish()` returns `True` for it. The loop stops at the
+first row that doesn't confirm (connection dropped again mid-replay, or
+a genuine publish failure) rather than skipping ahead, so nothing later
+in the buffer can ever be sent out of order ahead of something earlier
+that's still unconfirmed.
+
+### Fault injection: four named scenarios, not a chaos framework
+
+`edge_gateway/fault_injection.py` provides `force_publish_failures()` (a
+context manager that makes `publish()` report failure for a fixed count,
+without touching the network -- used by the deterministic tests) plus
+`malformed_frame()` and `out_of_range_frame()` builders that reuse
+`ingestion.py`/`validation.py`'s existing rejection paths. The real demo
+uses an actual `docker compose stop mosquitto` for the outage scenario
+(see README.md) -- Docker Compose is already this project's one broker
+mechanism, so there's no need to fake that particular failure mode.
+
+### Testing strategy, extended
+
+`test_buffer.py` and `test_fault_injection.py` are new no-broker-needed
+unit tests, alongside `test_gateway_unit.py` (mocked bus/publisher/
+buffer, verifying `run_once()` calls `try_reconnect()` and then
+`_replay_buffered()` only on a successful reconnect -- fast and
+deterministic, no real broker). `test_mqtt_publisher.py` gained backoff/
+disconnect tests using `pytest`'s `monkeypatch` on the underlying
+paho-mqtt client, so timing and network failures are simulated rather
+than waited-for. `test_gateway_integration.py` gained three new
+real-broker tests (publish failure buffers the event; the gateway keeps
+ingesting/validating through an outage; buffered events replay in order
+and drain the buffer) built with `force_publish_failures()` for a
+deterministic "outage," while the three pre-existing Phase 3 tests in
+that file are unchanged except for one added assertion each (`buffer
+stays empty`) confirming a rejected or ignored frame is never buffered
+either.
+
+## Publishing to AWS IoT Core (Phase 5)
+
+Phase 5 does not add a second publisher implementation. AWS IoT Core is
+plain MQTT over TLS -- exactly the protocol `mqtt_publisher.py` already
+speaks -- so `MqttPublisher` gained three optional constructor arguments
+(`tls_ca_certs`, `tls_certfile`, `tls_keyfile`) instead. All three must
+be given together, or a `ValueError` is raised immediately; given none
+(every Phase 1-4 caller), the client behaves exactly as before. `connect()`,
+`publish()`, `try_reconnect()`, and every line of Phase 4's buffering/
+backoff logic are unchanged.
+
+`edge_gateway/cloud_publisher.py` is the one place that decides which
+broker a run actually talks to, by reading `AWS_IOT_*` environment
+variables (see `docs/aws-setup.md`): none set -> build a local Mosquitto
+`MqttPublisher`; all four required ones set and valid -> build an
+AWS-IoT-Core-pointed one with TLS; anything in between -> raise
+`AwsIotConfigError` and refuse to start, rather than silently falling
+back to local Mosquitto. `gateway.py` is not part of this decision at
+all -- it receives whichever `MqttPublisher` `run_demo.py` (via
+`cloud_publisher.py`) constructed, and has no branch anywhere for "which
+broker is this."
+
+The MQTT topic scheme and payload are identical either way:
+`vehicle/{vehicle_id}/telemetry/{source_ecu}/{signal_name}`, carrying
+`TelemetryEvent`'s own JSON -- no schema or topic change was needed for
+AWS IoT Core. On the AWS side, one IoT Rule
+(`SELECT * FROM 'vehicle/+/telemetry/+/+'`, see `infra/iot_rule.tf`)
+routes matching telemetry to CloudWatch Logs; Kinesis is deliberately
+deferred (see `ARCHITECTURE.md`'s Phase 5 decision row).

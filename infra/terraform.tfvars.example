@@ -1,0 +1,10 @@
+# Copy to terraform.tfvars and adjust if needed -- terraform.tfvars
+# itself is gitignored (see ../.gitignore), only this .example file is
+# tracked. All of these have working defaults in variables.tf, so
+# terraform.tfvars is optional; create one only if you want to override
+# something.
+
+aws_region                    = "us-east-1"
+thing_name                    = "edge-to-cloud-telemetry-poc-vehicle"
+cloudwatch_log_retention_days = 14
+certs_output_dir              = "./certs"

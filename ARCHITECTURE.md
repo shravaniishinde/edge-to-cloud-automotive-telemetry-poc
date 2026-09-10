@@ -1,6 +1,6 @@
 # Architecture & Phase Plan
 
-Status: Phase 3 complete. Implementation proceeds phase by phase; each
+Status: Phase 5 complete. Implementation proceeds phase by phase; each
 phase is reviewed before the next begins. This document is the single
 source of truth for *why* the system is shaped the way it is — update it
 whenever a phase changes or adds a decision.
@@ -120,7 +120,16 @@ developer's own machine or CI). See `docs/edge-gateway-spec.md`.
 | `session_id` moved from simulator-owned to gateway-owned | Raw CAN frames never carried a session concept — only `can_id` and 8 data bytes exist on the wire. Now that a real listener (the gateway) exists, it mints its own `session_id` per run and attaches it during decode, matching how a real edge component owns correlation context rather than the sensors themselves. |
 | Gateway validation rejects, not flags | An out-of-range decoded value (e.g. `battery_soc_pct=500`) is dropped and logged, not forwarded with a warning marker — gives Phase 4's fault injection a clean pass/fail signal, and keeps "what got published" trustworthy by construction. |
 | MQTT topic scheme: `vehicle/{vehicle_id}/telemetry/{source_ecu}/{signal_name}` | Standard MQTT/IoT topic-hierarchy practice — lets a subscriber filter by vehicle, ECU, or specific signal without inspecting every payload. Payload is `TelemetryEvent`'s own JSON, no new schema introduced. |
-| Real-broker integration tests spawn `mosquitto` via subprocess, not Docker | This sandbox (and possibly some CI runners) can't rely on a working Docker daemon; `apt-get install mosquitto` reliably provides the binary. `docker/docker-compose.yml` remains the setup for manual/demo use on a developer's own machine. |
+| Real-broker integration tests connect to an already-running broker, not spawn one themselves | `edge_gateway/tests/conftest.py`'s fixture just checks `localhost:1883` (overridable via `MQTT_BROKER_HOST`/`MQTT_BROKER_PORT`) is reachable and skips if not, rather than owning a broker's lifecycle. `docker/docker-compose.yml` is the one broker mechanism for local dev, manual demos, and CI alike -- CI provides its own equivalent broker by installing the `mosquitto` package, which starts it as a systemd service, since GitHub-hosted runners don't guarantee a working Docker daemon. |
+| Reconnect is paced by the gateway's own loop, not a dedicated thread | `try_reconnect()` is a cheap timestamp check most of the time, gated by exponential backoff (1s, doubling, capped at 30s); `EdgeGateway.run_once()` calls it once per iteration. Keeps retry timing simple and explainable without adding a second thread's worth of lifecycle/shutdown concerns for what a POC needs. |
+| Buffer replay stops at the first unconfirmed row instead of skipping ahead | Preserves strict FIFO ordering -- correct for time-series signals -- at the cost of one slow/failing event blocking everything behind it until it either confirms or the connection drops again. Accepted: correctness of order matters more here than replay throughput. |
+| Delivery guarantee is at-least-once, not exactly-once | A buffered row is deleted only after a real broker PUBACK (verified from paho-mqtt's own source, not assumed); the accepted gap is a possible duplicate replay if the process crashes between that acknowledgement and the delete. Closing that gap fully needs a distributed transaction this POC doesn't need to demonstrate. |
+| Fault injection is 4 named scenarios, not a chaos framework | Deterministic and interview-explainable: force N publish failures, a malformed frame, an out-of-range frame, plus a real `docker compose stop` for the actual outage demo. A randomized chaos-monkey approach would add flakiness and complexity with no corresponding teaching value at this scale. |
+| AWS IoT Core support extends `MqttPublisher` with optional TLS args, not a second publisher class | AWS IoT Core is plain MQTT over TLS -- the exact protocol `MqttPublisher` already speaks. Adding `tls_ca_certs`/`tls_certfile`/`tls_keyfile` as optional constructor args (all-or-nothing, or a `ValueError`) keeps exactly one publish/reconnect/backoff implementation, unchanged from Phase 4, rather than duplicating that logic in a `CloudPublisher` subclass. No new AWS SDK dependency is needed as a result. |
+| Local-vs-AWS selection lives in `edge_gateway/cloud_publisher.py`, not in `gateway.py` or CLI flags | `EdgeGateway` still just receives an already-constructed `MqttPublisher` -- it has no idea, and doesn't need to know, whether that publisher is talking to Mosquitto or AWS IoT Core. Reading environment variables and deciding which to build is a separate, independently testable concern. |
+| Partial AWS configuration fails fast, never falls back to local Mosquitto | Deliberate: a half-configured AWS setup silently talking to a developer's local broker instead would be a confusing, hard-to-notice failure mode. `cloud_publisher.py` raises `AwsIotConfigError` (uncaught) the moment some but not all `AWS_IOT_*` variables are set, or a configured certificate file doesn't exist. |
+| Kinesis deferred again in Phase 5 | Reconfirms the Phase 0-era "Kinesis excluded" decision above: CloudWatch Logs alone fully proves the telemetry-reached-the-cloud story this phase needs. If ever justified, it's a second IoT Rule action pointed at a Kinesis stream -- an AWS-side routing change, not a Edge Gateway code change, which is exactly why an IoT Rule (not the gateway) owns fan-out. |
+| AWS IoT device certificate generated by Terraform (`active = true`, no CSR), not device-generated | Simplest path for a single-developer POC -- one `terraform apply` produces a working key pair and certificate. A production fleet would instead have each device generate its own key locally and submit only a CSR, so the private key never exists in Terraform state; documented as a known, intentional simplification (see `docs/assumptions-and-limitations.md` and `docs/aws-setup.md`). |
 
 ## 4. Target repository structure
 
@@ -137,7 +146,7 @@ edge-to-cloud-automotive-telemetry-poc/
 │   ├── can-signal-spec.md               [Phase 1 — done]
 │   ├── uds-spec.md                      [Phase 2 — done]
 │   ├── edge-gateway-spec.md             [Phase 3 — done]
-│   └── aws-setup.md                     [Phase 5]
+│   └── aws-setup.md                     [Phase 5 — done]
 ├── common/                              [Phase 1 — shared schema package — done]
 │   ├── telemetry_schema.py              [Phase 1 — TelemetryEvent — done]
 │   ├── can_signal_map.py                [Phase 1 — 11-message CAN registry + encode/decode — done]
@@ -151,12 +160,13 @@ edge-to-cloud-automotive-telemetry-poc/
 │   ├── tests/                           [Phase 1 — done]
 │   └── uds/                             [Phase 2 — uds_server.py, uds_client.py, tests/ — done]
 ├── edge_gateway/                        [Phase 3 — done]
-│   ├── ingestion.py, validation.py, normalization.py, mqtt_publisher.py, logging_config.py, gateway.py [Phase 3 — done]
-│   ├── tests/                           [Phase 3 — unit + real-broker integration — done]
-│   ├── buffer.py, fault_injection.py    [Phase 4]
-│   ├── cloud_publisher.py (TLS/IoT Core)[Phase 5]
+│   ├── ingestion.py, validation.py, normalization.py, gateway.py [Phase 3 — done, untouched since]
+│   ├── mqtt_publisher.py                [Phase 3 — done; extended Phase 4 (reconnect/backoff) and Phase 5 (optional TLS)]
+│   ├── tests/                           [Phase 3 — unit + real-broker integration — done, extended Phase 4 and 5]
+│   ├── buffer.py, fault_injection.py    [Phase 4 — done]
+│   ├── cloud_publisher.py (local-vs-AWS selection, TLS config) [Phase 5 — done]
 │   └── metrics.py                       [Phase 6]
-├── infra/                               [Phase 5 — Terraform: IoT Core, IAM, CloudWatch]
+├── infra/                               [Phase 5 — done — Terraform: IoT Thing/certificate/policy/rule, CloudWatch log group]
 ├── analyzer/                            [Phase 9: rules_engine.py, llm_analyzer.py, prompts/]
 ├── dashboard/                           [Phase 10: backend/ (REST+WebSocket), frontend/]
 ├── scenarios/resilience_demo.py         [Phase 8]
@@ -173,8 +183,8 @@ edge-to-cloud-automotive-telemetry-poc/
 | 1 | Vehicle simulation + shared schema foundation — **done** | `common/telemetry_schema.py`, `common/can_signal_map.py`, `common/tests/`, `simulation/can_bus.py`, `simulation/ecus/` (3 ECUs), `simulation/run_simulation.py`, `simulation/tests/`, `docs/can-signal-spec.md`, `pytest.ini`, `.github/workflows/ci.yml` |
 | 2 | UDS diagnostics — **done** | `simulation/uds/`, `common/diagnostic_schema.py`, `docs/uds-spec.md` |
 | 3 | Edge Gateway core — **done** | `edge_gateway/` (ingestion, validation, normalization, mqtt_publisher, logging, gateway), `run_demo.py`, `docker/docker-compose.yml` (local Mosquitto), `docs/edge-gateway-spec.md` |
-| 4 | Buffering, retry, fault injection | `edge_gateway/buffer.py`, `fault_injection.py`, `common/operational_schema.py` if needed |
-| 5 | AWS integration | `infra/` (Terraform), `edge_gateway/cloud_publisher.py`, `docs/aws-setup.md` |
+| 4 | Buffering, retry, fault injection — **done** | `edge_gateway/buffer.py`, `edge_gateway/fault_injection.py` (a separate `common/operational_schema.py` turned out not to be needed -- the buffer's rows are plain SQLite columns, not a new Pydantic model) |
+| 5 | AWS integration — **done** | `infra/` (Terraform), `edge_gateway/cloud_publisher.py`, `docs/aws-setup.md` (Kinesis deliberately deferred — see decision table above) |
 | 6 | Observability | `edge_gateway/metrics.py`, correlation IDs finalized end-to-end |
 | 7 | Testing & CI hardening | full pytest suite, one full-scenario integration test, expanded CI, finalized `assumptions-and-limitations.md` |
 | 8 | Resilience demo | `scenarios/resilience_demo.py` |

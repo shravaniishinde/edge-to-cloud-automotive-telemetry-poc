@@ -1,10 +1,12 @@
-# Phase 3: a local Mosquitto broker for manual/demo use (run_demo.py) and
-# for developers who prefer Docker over installing mosquitto directly.
-# The automated test suite does NOT depend on this file -- see
-# edge_gateway/tests/conftest.py for why it launches its own mosquitto
-# subprocess instead (this environment's sandbox and CI runners aren't
-# guaranteed to have a usable Docker daemon, but they can apt-get install
-# the mosquitto binary directly).
+# Phase 3: a local Mosquitto broker for manual/demo use (run_demo.py),
+# local development, and CI alike -- this is the project's one broker
+# mechanism. edge_gateway/tests/conftest.py's mosquitto_broker fixture
+# just connects to whatever broker is already running at localhost:1883
+# rather than spawning one itself, so it works the same way whether that
+# broker came from this compose file or elsewhere. CI provides an
+# equivalent broker without Docker by installing the mosquitto package
+# directly (see .github/workflows/ci.yml), since GitHub-hosted runners
+# don't guarantee a working Docker daemon.
 #
 # Usage: docker compose -f docker/docker-compose.yml up
 services:

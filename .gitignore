@@ -35,6 +35,13 @@ docker/volumes/
 !*.tfvars.example
 crash.log
 
+# --- AWS IoT Core device credentials (Phase 5) ---
+# terraform apply (see infra/) writes the generated device certificate,
+# private key, and downloaded root CA here. *.pem/*.crt/*.key above
+# already cover these files individually; this directory is called out
+# explicitly too since it's where docs/aws-setup.md tells you to look.
+infra/certs/
+
 # --- Dashboard frontend (introduced Phase 10) ---
 node_modules/
 dist/

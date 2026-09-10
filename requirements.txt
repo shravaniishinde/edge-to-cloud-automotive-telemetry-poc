@@ -24,6 +24,18 @@ paho-mqtt==2.1.0        # MQTT client for publishing to local Mosquitto (and AWS
 # (`apt-get install mosquitto`) for local test runs, or run via
 # docker/docker-compose.yml (eclipse-mosquitto:2 image) for manual/demo use.
 
+# --- Phase 4: buffering, reconnect/backoff, fault injection ---
+# No new dependency -- the persistent buffer uses sqlite3 (Python's own
+# standard library), and the reconnect/backoff logic is built directly on
+# paho-mqtt (already listed above under Phase 3).
+
+# --- Phase 5: AWS IoT Core integration ---
+# No new Python dependency here either, and deliberately no AWS SDK
+# (boto3) -- AWS IoT Core's device endpoint is plain MQTT over TLS, which
+# paho-mqtt (Phase 3) already speaks; only paho-mqtt's own tls_set() is
+# used. AWS resource provisioning (infra/) is handled by Terraform, a
+# separate tool, not a Python dependency of this project.
+
 # Expected future additions (not yet installed):
 #   Phase 9 - anthropic
 #   Phase 10 - fastapi, uvicorn (dashboard backend) - to be confirmed at that phase

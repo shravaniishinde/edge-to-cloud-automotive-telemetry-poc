@@ -1,20 +1,21 @@
 """
-Spins up a real, throwaway Mosquitto broker for the one integration test
-that needs one (test_gateway_integration.py), rather than mocking MQTT
-entirely -- the whole point of that test is proving the real wire-level
-publish/subscribe path works, the same reasoning behind Phase 2's real
-virtual-bus UDS integration test.
+Connects to an already-running MQTT broker for the one integration test
+module that needs one (test_gateway_integration.py), rather than mocking
+MQTT entirely -- the whole point of those tests is proving the real
+wire-level publish/subscribe path works, the same reasoning behind
+Phase 2's real virtual-bus UDS integration test.
 
-Runs `mosquitto` directly as a subprocess (not via docker-compose) because
-this is what a CI runner or a sandboxed dev environment can rely on being
-installed via `apt-get install mosquitto`, without needing a working
-Docker daemon. `docker/docker-compose.yml` is the equivalent for a
-developer's own machine (`docker compose up`) -- same broker, different
-launch mechanism, so there's exactly one topic/config truth
-(docs/edge-gateway-spec.md), not two competing setups.
+This fixture does NOT spawn its own Mosquitto process. It expects a
+broker to already be listening -- normally the one started by
+`docker compose -f docker/docker-compose.yml up`, this project's one
+broker mechanism for local development, manual demo use, and CI alike
+(see docs/edge-gateway-spec.md) -- and simply connects to it.
 
-Uses port 18830 (not the default 1883) so this never collides with a
-broker a developer might already have running locally.
+Defaults to `localhost:1883` (Mosquitto's standard port), overridable via
+the `MQTT_BROKER_HOST` / `MQTT_BROKER_PORT` environment variables for
+environments where the broker runs elsewhere. If nothing is reachable at
+that host/port, every test that depends on this fixture is skipped
+(not failed), with a message telling you to start the broker first.
 """
 
 from __future__ import annotations

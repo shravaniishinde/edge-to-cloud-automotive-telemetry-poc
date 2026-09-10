@@ -1,7 +1,9 @@
 """
-Live demo entry point for Phase 3: the 3 simulated ECUs and the Edge
-Gateway running together against one shared virtual CAN bus, with the
-gateway publishing validated telemetry to a real MQTT broker.
+Live demo entry point for Phase 3 (extended in Phase 4): the 3 simulated
+ECUs and the Edge Gateway running together against one shared virtual CAN
+bus, with the gateway publishing validated telemetry to a real MQTT
+broker -- and, since Phase 4, buffering and replaying through a real
+broker outage rather than losing data.
 
 Why this lives here instead of extending simulation/run_simulation.py or
 adding a "gateway-only" script under edge_gateway/: python-can's virtual
@@ -19,6 +21,22 @@ Requires a reachable MQTT broker (see docker/docker-compose.yml, or run
 
 Usage:
     python run_demo.py --duration 10 --mqtt-host localhost --mqtt-port 1883
+
+To see Phase 4's resilience story while this is running, in another
+terminal: `docker compose -f docker/docker-compose.yml stop mosquitto`,
+watch this script's logs shift from "published" to "buffered", then
+`docker compose -f docker/docker-compose.yml start mosquitto` and watch
+the logs show a reconnect followed by a burst of "replayed" events. See
+README.md for the full walkthrough.
+
+Phase 5: which broker this connects to (local Mosquitto vs. AWS IoT
+Core) is decided by `edge_gateway/cloud_publisher.py`, not by anything
+in this file -- see that module's docstring and docs/aws-setup.md. In
+short: set no AWS_IOT_* environment variables to keep using local
+Mosquitto via --mqtt-host/--mqtt-port exactly as before, or set all of
+them (endpoint + cert paths) to connect to AWS IoT Core instead. Setting
+only some of them is a configuration error and this script will refuse
+to start rather than silently falling back to local Mosquitto.
 """
 
 from __future__ import annotations
@@ -28,9 +46,10 @@ import logging
 import threading
 
 from common.telemetry_schema import DEFAULT_VEHICLE_ID
+from edge_gateway.buffer import TelemetryBuffer
+from edge_gateway.cloud_publisher import build_publisher_from_env
 from edge_gateway.gateway import EdgeGateway
 from edge_gateway.logging_config import configure_logging
-from edge_gateway.mqtt_publisher import MqttPublisher
 from simulation.can_bus import get_bus, run_ecu
 from simulation.ecus.battery_ecu import BatteryECU
 from simulation.ecus.body_ecu import BodyECU
@@ -38,8 +57,15 @@ from simulation.ecus.powertrain_ecu import PowertrainECU
 
 simulator_logger = logging.getLogger("simulation")
 
+DEFAULT_BUFFER_PATH = "edge_gateway/data/buffer.db"
 
-def main(duration_seconds: float = None, mqtt_host: str = "localhost", mqtt_port: int = 1883) -> None:
+
+def main(
+    duration_seconds: float = None,
+    mqtt_host: str = "localhost",
+    mqtt_port: int = 1883,
+    buffer_path: str = DEFAULT_BUFFER_PATH,
+) -> None:
     configure_logging(verbose=False)
 
     # --- ECUs: intentionally small duplication of run_simulation.py's
@@ -61,11 +87,23 @@ def main(duration_seconds: float = None, mqtt_host: str = "localhost", mqtt_port
         for ecu, bus in zip(ecus, ecu_buses)
     ]
 
-    # --- Edge Gateway: its own bus handle, its own session_id ---
+    # --- Edge Gateway: its own bus handle, its own session_id, and (since
+    # Phase 4) its own persistent buffer for publishes that fail live ---
+    # Phase 5: build_publisher_from_env() decides local Mosquitto vs. AWS
+    # IoT Core (mqtt_host/mqtt_port below are only used in the local
+    # case -- see edge_gateway/cloud_publisher.py and docs/aws-setup.md).
+    # It raises AwsIotConfigError, uncaught, if AWS_IOT_* env vars are
+    # only partially set -- this script deliberately does not catch that,
+    # so a misconfiguration stops startup with a clear message instead of
+    # silently talking to local Mosquitto.
     gateway_bus = get_bus()
-    publisher = MqttPublisher(host=mqtt_host, port=mqtt_port)
+    publisher = build_publisher_from_env(
+        local_host=mqtt_host, local_port=mqtt_port,
+        logger=logging.getLogger("run_demo.cloud_publisher"),
+    )
     publisher.connect()
-    gateway = EdgeGateway(gateway_bus, publisher, vehicle_id=DEFAULT_VEHICLE_ID)
+    buffer = TelemetryBuffer(buffer_path)
+    gateway = EdgeGateway(gateway_bus, publisher, buffer, vehicle_id=DEFAULT_VEHICLE_ID)
     gateway_thread = threading.Thread(target=gateway.run, args=(stop_event,), daemon=True)
 
     logging.getLogger("run_demo").info(
@@ -97,8 +135,13 @@ def main(duration_seconds: float = None, mqtt_host: str = "localhost", mqtt_port
                 "processed": gateway.processed_count,
                 "rejected": gateway.rejected_count,
                 "publish_failures": gateway.publish_failure_count,
+                "buffered": gateway.buffered_count,
+                "replayed": gateway.replayed_count,
+                "buffer_dropped": buffer.dropped_count,
+                "still_buffered": buffer.count(),  # must be read before buffer.close() below
             },
         )
+        buffer.close()
 
 
 if __name__ == "__main__":
@@ -108,5 +151,12 @@ if __name__ == "__main__":
     parser.add_argument("--duration", type=float, default=None, help="Run for N seconds then stop")
     parser.add_argument("--mqtt-host", type=str, default="localhost")
     parser.add_argument("--mqtt-port", type=int, default=1883)
+    parser.add_argument(
+        "--buffer-path", type=str, default=DEFAULT_BUFFER_PATH,
+        help="Where the SQLite resilience buffer is stored (default: %(default)s)",
+    )
     args = parser.parse_args()
-    main(duration_seconds=args.duration, mqtt_host=args.mqtt_host, mqtt_port=args.mqtt_port)
+    main(
+        duration_seconds=args.duration, mqtt_host=args.mqtt_host, mqtt_port=args.mqtt_port,
+        buffer_path=args.buffer_path,
+    )

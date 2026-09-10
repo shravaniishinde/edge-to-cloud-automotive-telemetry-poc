@@ -23,11 +23,14 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # Phase 3's edge_gateway/tests/conftest.py spawns its own mosquitto
-      # subprocess for the real-broker integration test -- installing the
-      # binary here (rather than using a Docker service container) keeps
-      # CI's setup identical to what a sandboxed dev environment without a
-      # working Docker daemon can do. See docs/edge-gateway-spec.md.
+      # edge_gateway/tests/conftest.py's mosquitto_broker fixture connects
+      # to an already-running broker at localhost:1883 -- it does not spawn
+      # one itself. Installing the mosquitto package here starts its
+      # systemd service automatically, which is what provides that
+      # already-running broker for CI without needing a Docker daemon on
+      # the runner. A developer's own machine uses
+      # docker/docker-compose.yml for the same broker instead.
+      # See docs/edge-gateway-spec.md.
       - name: Install Mosquitto broker
         run: sudo apt-get update && sudo apt-get install -y mosquitto
 
