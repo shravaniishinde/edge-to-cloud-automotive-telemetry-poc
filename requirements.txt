@@ -36,6 +36,13 @@ paho-mqtt==2.1.0        # MQTT client for publishing to local Mosquitto (and AWS
 # used. AWS resource provisioning (infra/) is handled by Terraform, a
 # separate tool, not a Python dependency of this project.
 
+# --- Phase 6: Diagnostic Anomaly Analyzer ---
+anthropic==1.5.0        # OPTIONAL advisory explanation layer only (analyzer/llm_explainer.py).
+                        # The analyzer works completely without this being configured: no
+                        # ANTHROPIC_API_KEY -> explain_anomaly() returns None immediately and
+                        # is never called with a missing key. Deterministic rule detection
+                        # (analyzer/rules.py) has no dependency on this package at all -- it
+                        # is imported nowhere outside llm_explainer.py. See docs/analyzer-spec.md.
+
 # Expected future additions (not yet installed):
-#   Phase 9 - anthropic
 #   Phase 10 - fastapi, uvicorn (dashboard backend) - to be confirmed at that phase

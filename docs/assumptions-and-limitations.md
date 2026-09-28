@@ -224,4 +224,49 @@ introduces a simplification worth being explicit about.
   you've actually provisioned AWS IoT Core via `infra/`. This mirrors
   Phase 3/4's `mosquitto_broker` fixture skip pattern exactly.
 
+## Assumptions and limitations added in Phase 6
+
+- The Diagnostic Anomaly Analyzer (originally planned for Phase 9; moved
+  up -- see `ARCHITECTURE.md`'s "Phase reordering" note) is a set of
+  threshold-based, hand-tuned-for-a-POC rules, not a trained or validated
+  anomaly detection system. Its thresholds and time windows were chosen
+  for interview explainability, not against any real vehicle telemetry
+  data (none exists for this project) or a measured false-positive/
+  false-negative rate. See `docs/analyzer-spec.md`'s "False positives and
+  false negatives" section for specific, expected examples.
+- `repeated_dtc_queries` is expected to produce false positives in normal
+  use: a technician or scan tool legitimately polling DTCs can easily
+  exceed the default threshold. It is rated `info` severity specifically
+  because of this, not `warning`.
+- `repeated_p0217_activity` will fire on nearly every DTC-query burst in
+  this POC, because `simulation/uds/uds_server.py`'s server always
+  returns its full static DTC list (including P0217) on every positive
+  `ReadDTCInformation` response, regardless of the requested status mask
+  (a Phase 2 simplification -- see `docs/uds-spec.md`). This is a property
+  of the simulated ECU's fixed DTC list, not evidence that the rule
+  itself is well-calibrated against realistic, varying DTC data.
+- `DiagnosticAnalyzer` and every rule are stateless and read no clock:
+  `analyze()` takes whatever event list it's given and returns the same
+  findings no matter how many times, or when, it's called with that same
+  list. There is no persistence layer for `DiagnosticEvent`s or
+  `AnomalyReport`s in this phase -- both exist only in memory, in
+  whatever list a caller is holding (a test, or eventually a dashboard
+  backend). This is an intentional, minimal scope for this phase, not an
+  oversight -- see the "no databases/queues/microservices for Phase 6"
+  constraint this phase was built under.
+- The optional LLM explanation layer never runs unless `ANTHROPIC_API_KEY`
+  is set (never the default, and never set in CI). When it does run, its
+  output is exactly as reliable as the underlying model's output for a
+  short summarization task -- it is stored separately
+  (`AnomalyReport.llm_explanation`) and is never treated as authoritative
+  or used to alter a rule's decision. A network failure, timeout, or
+  missing `anthropic` package produces `None`, not an exception, so a
+  flaky LLM call can never interrupt or crash analysis.
+- None of the analyzer's severity levels (`info`/`warning`/`critical`)
+  should be read as a safety determination. `repeated_p0217_activity` is
+  deliberately capped at `warning` rather than `critical`, even though
+  the underlying DTC concerns engine overtemperature, specifically to
+  avoid overstating what a POC rule reading a static, illustrative DTC
+  list actually knows -- see `docs/analyzer-spec.md`.
+
 Further entries are added as each phase is implemented.
