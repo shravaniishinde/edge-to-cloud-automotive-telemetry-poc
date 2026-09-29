@@ -1,0 +1,43 @@
+# Keeps the Docker build context small and avoids ever copying secrets or
+# local artifacts into an image, even though the Dockerfile's explicit
+# COPY list (common/, simulation/, edge_gateway/, analyzer/, run_demo.py,
+# requirements.txt) already wouldn't pick most of these up anyway.
+
+.git/
+.github/
+
+# Secrets and local env -- never baked into an image (see .env.example).
+.env
+.env.*
+!.env.example
+infra/certs/
+*.pem
+*.crt
+*.key
+*.p12
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Local runtime data (created by the gateway's own buffer, not source)
+*.sqlite3
+*.db
+edge_gateway/data/
+
+# Infra / docs / other tooling not needed inside the runtime image
+infra/
+docs/
+*.md
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/

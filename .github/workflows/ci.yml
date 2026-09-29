@@ -16,6 +16,13 @@ jobs:
         with:
           python-version: "3.11"
 
+      # Fast fail on a plain syntax error, in seconds, before spending
+      # time on apt-get/pip below. This only checks that every .py file
+      # parses -- it needs no third-party packages, so it works even if a
+      # dependency install is about to fail for an unrelated reason.
+      - name: Syntax check
+        run: python -m compileall -q common edge_gateway simulation analyzer run_demo.py
+
       # actions/setup-python provides its own isolated Python install, so
       # (unlike the externally-managed system Python used for local dev in
       # this project's sandbox) no --break-system-packages flag is needed

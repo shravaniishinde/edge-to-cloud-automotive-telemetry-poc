@@ -8,7 +8,19 @@
 # directly (see .github/workflows/ci.yml), since GitHub-hosted runners
 # don't guarantee a working Docker daemon.
 #
-# Usage: docker compose -f docker/docker-compose.yml up
+# `app` (added in the reproducibility/Docker/CI pass -- see
+# ARCHITECTURE.md's "Reproducibility, Docker & CI/CD" section) builds
+# docker/Dockerfile and runs the existing run_demo.py entry point (the 3
+# simulated ECUs + the Edge Gateway together, in one process/container --
+# see that Dockerfile's own comment on why). It is the only application
+# container: AWS IoT Core is a real external cloud service and is
+# deliberately NOT modeled as a container here (see docs/aws-setup.md).
+#
+# Usage:
+#   docker compose -f docker/docker-compose.yml up --build
+#   # Ctrl+C to stop, or in another terminal:
+#   docker compose -f docker/docker-compose.yml stop mosquitto   # Phase 4 outage demo
+#   docker compose -f docker/docker-compose.yml start mosquitto
 services:
   mosquitto:
     image: eclipse-mosquitto:2
@@ -17,3 +29,44 @@ services:
     volumes:
       - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
     restart: unless-stopped
+    healthcheck:
+      # mosquitto_pub ships inside the eclipse-mosquitto image itself --
+      # no extra tooling needed. Used so `app` (below) only starts once
+      # Mosquitto is actually accepting connections, not merely once its
+      # container process has started (those are not the same moment).
+      test: ["CMD-SHELL", "mosquitto_pub -h localhost -t healthcheck -m ping -q 0 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  app:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+    # Overrides run_demo.py's --mqtt-host default (localhost) with the
+    # Compose service name, which is how containers reach each other on
+    # the default Compose network -- no application code change needed.
+    command: ["python", "run_demo.py", "--mqtt-host", "mosquitto"]
+    environment:
+      # AWS IoT Core is optional and OFF by default here (all four unset
+      # below): leave them all blank to keep talking to local Mosquitto
+      # exactly as `command:` above sets up. Setting only SOME of them is
+      # treated as a configuration error by edge_gateway/cloud_publisher.py
+      # (by design -- it never silently falls back). To actually use AWS
+      # IoT Core from inside Docker, also bind-mount the certificate
+      # directory Terraform produced (see docs/aws-setup.md), e.g.:
+      #   volumes: ["../infra/certs:/app/certs:ro"]
+      # and point the *_PATH variables below at /app/certs/...
+      AWS_IOT_ENDPOINT: ${AWS_IOT_ENDPOINT:-}
+      AWS_IOT_PORT: ${AWS_IOT_PORT:-}
+      AWS_IOT_CLIENT_ID: ${AWS_IOT_CLIENT_ID:-}
+      AWS_IOT_CA_PATH: ${AWS_IOT_CA_PATH:-}
+      AWS_IOT_CERT_PATH: ${AWS_IOT_CERT_PATH:-}
+      AWS_IOT_KEY_PATH: ${AWS_IOT_KEY_PATH:-}
+      # Optional Phase 6 advisory LLM layer -- unset by default. Never
+      # required for the gateway/analyzer core to run.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    restart: on-failure

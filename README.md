@@ -57,11 +57,24 @@ pipeline, the system now demonstrates a resilient edge-to-cloud pipeline
 with advisory diagnostic analysis end to end. No dashboard code exists
 yet.
 
+On top of that, this repository has also been made reproducible and
+CI/CD-ready: a `Dockerfile` and an extended `docker/docker-compose.yml`
+run the whole demo in containers, and `.github/workflows/ci.yml` runs the
+full test suite on every push/PR. See "Run with Docker" and "CI/CD"
+below, and ARCHITECTURE.md's "Reproducibility, Docker & CI/CD" section
+for the full reasoning. (This work is orthogonal to the phase-numbered
+feature list above — it hardens everything built so far rather than
+adding a new one.)
+
 ## Requirements
 
 This list grows as each phase introduces a real dependency:
 
-- Python 3.11 (see `requirements.txt` for pinned package versions)
+- Python 3.11 — standardized across local development, Docker, and CI
+  (see `requirements.txt` for pinned package versions). If your machine's
+  default `python`/`python3` is a different version, use Docker (below)
+  or a `python3.11` interpreter directly instead of changing this
+  project's target version.
 - A local MQTT broker: either `docker compose -f docker/docker-compose.yml up`
   (Docker & Docker Compose), or install `mosquitto` directly
   (`apt-get install mosquitto` on Debian/Ubuntu) and run it with
@@ -71,7 +84,7 @@ This list grows as each phase introduces a real dependency:
   and designed to be torn down cleanly after use — see
   [docs/aws-setup.md](docs/aws-setup.md))
 
-## Getting started
+## Run locally
 
 ```bash
 pip install -r requirements.txt   # add --break-system-packages on Debian/Ubuntu system Python
@@ -114,6 +127,64 @@ docker compose -f docker/docker-compose.yml start mosquitto
 # "replayed buffered events", and mosquitto_sub receive that same burst
 # in original order
 ```
+
+## Run with Docker
+
+Everything above also runs in containers, with no local Python
+installation needed at all:
+
+```bash
+docker compose -f docker/docker-compose.yml up --build
+```
+
+This builds `docker/Dockerfile` (Python 3.11, matching this project's
+standardized runtime — see "Requirements" above) and starts two
+containers: `mosquitto` (the same broker as above) and `app`, which runs
+`run_demo.py` exactly as it runs locally. `app` waits for `mosquitto` to
+actually be accepting connections (a Docker healthcheck) before it
+starts, so there's no manual ordering to get right. Watch both
+containers' logs with the command above, or `docker compose -f
+docker/docker-compose.yml logs -f app` for just the demo. Stop everything
+with Ctrl+C, or `docker compose -f docker/docker-compose.yml down`.
+
+The same Phase 4 outage demo works here too — `docker compose -f
+docker/docker-compose.yml stop mosquitto` / `start mosquitto` in another
+terminal while `up` is running, exactly as described above.
+
+**Why one `app` container, not separate simulator/gateway containers:**
+`python-can`'s virtual CAN bus only shares frames *within one OS
+process*, so the 3 simulated ECUs and the Edge Gateway run together, as
+threads inside this single container — splitting them into two
+containers would leave the gateway with no bus traffic to read. See
+`docker/Dockerfile`'s own comments and
+[docs/edge-gateway-spec.md](docs/edge-gateway-spec.md).
+
+`app` needs no AWS or Anthropic credentials to run — see
+`docker/docker-compose.yml`'s comments for how to optionally point it at
+AWS IoT Core instead of local Mosquitto, or enable the analyzer's
+advisory LLM layer, both purely via environment variables (never baked
+into the image).
+
+## CI/CD
+
+Every push and pull request to `main` runs
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) on GitHub-hosted
+Ubuntu runners: checkout → Python 3.11 → a fast syntax check → install
+`requirements.txt` → install and start a local Mosquitto broker (via
+`apt-get`, since GitHub-hosted runners don't guarantee a working Docker
+daemon) → `pytest -v`. A failing test fails the workflow run, visible
+directly on the commit/PR.
+
+CI requires **no secrets or paid services**: no AWS credentials, no AWS
+IoT Core resources, and no `ANTHROPIC_API_KEY`. Tests that need those
+(the AWS IoT smoke test, and anything that would make a real Anthropic
+API call) are written to skip safely when they're absent — CI proves the
+simulator, UDS diagnostics, Edge Gateway (including against a real local
+Mosquitto broker), buffering/resilience, and the deterministic analyzer
+rules all work; it does not prove connectivity to a real AWS account,
+which is inherently something only a run with real credentials can show.
+See ARCHITECTURE.md's "Reproducibility, Docker & CI/CD" section for
+exactly which tests run in CI vs. which require real AWS credentials.
 
 ## Cloud (AWS IoT Core)
 

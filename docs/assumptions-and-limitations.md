@@ -270,3 +270,32 @@ introduces a simplification worth being explicit about.
   list actually knows -- see `docs/analyzer-spec.md`.
 
 Further entries are added as each phase is implemented.
+
+## Assumptions and limitations added in the reproducibility/Docker/CI pass
+
+- The Edge Gateway's SQLite buffer (`edge_gateway/data/buffer.db`) is
+  created inside the `app` container's own filesystem at runtime. It is
+  not backed by a named volume by default, so it does not survive
+  `docker compose down` / a container recreation — only container
+  restarts. This is consistent with the buffer's existing purpose
+  (surviving a process restart during an outage demo, not acting as
+  durable long-term storage) and was not changed for this pass.
+- `docker/Dockerfile` was written and its syntax verified (`docker
+  compose config` parses cleanly), but a full `docker build` could not be
+  executed inside the sandbox this work was done in: that sandbox's
+  outbound network policy blocks the Docker Hub registry
+  (`registry-1.docker.io`) needed to pull the `python:3.11-slim` base
+  image, returning an explicit `403 Forbidden` at the proxy level. This
+  is a sandbox network restriction, not a defect in the Dockerfile or
+  Compose file. The full pytest suite (154 passed/7 skipped without a
+  broker, 160 passed/1 skipped with a local Mosquitto broker running) was
+  run directly in a Python 3.11 virtual environment in the same sandbox
+  and is unaffected by this restriction. Building the image and running
+  `docker compose up` should be verified on a machine with normal
+  internet access (e.g. the developer's own machine) before relying on
+  it.
+- `.github/workflows/ci.yml` does not build or run the Docker image --
+  only `pytest`. GitHub Actions' own hosted runners do have normal
+  internet access, so this is a scope decision (kept out to keep CI fast
+  and focused on tests), not a limitation carried over from the sandbox
+  restriction above.

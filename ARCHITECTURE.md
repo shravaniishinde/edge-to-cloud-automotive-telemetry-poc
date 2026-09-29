@@ -15,6 +15,20 @@ have existed since Phase 2). Observability, Testing/CI hardening, and the
 Resilience demo shift to Phases 7-9 accordingly; nothing about their
 scope changed, only their order.
 
+**Naming note (reproducibility/Docker/CI pass):** a later work session
+was itself referred to as "Phase 7," but its actual content — Docker,
+Docker Compose, GitHub Actions/CI hardening, and Python-version
+standardization across the whole repo — is a cross-cutting
+reproducibility pass over everything built in Phases 1-6, not the
+feature-numbered Phase 7 ("Observability," `edge_gateway/metrics.py`)
+this section's table still lists below. To avoid silently renumbering an
+approved phase plan, that work is documented in its own section (9,
+below) rather than folded into "Phase 7" in the table. The feature-phase
+numbering in section 5 is otherwise unchanged and still applies going
+forward — resolve this naming overlap explicitly (e.g. rename the
+table's Phase 7, or keep both, whichever you prefer) before it causes
+confusion later.
+
 ## 1. Scope & framing
 
 This is a no-hardware, portfolio-grade Proof of Concept. It is described
@@ -147,6 +161,13 @@ developer's own machine or CI). See `docs/edge-gateway-spec.md`.
 | No persistence layer for diagnostic events or anomaly reports in Phase 6 | Explicitly out of scope per this phase's plan ("do not introduce databases, queues, or microservices"). `DiagnosticAnalyzer.analyze()` takes whatever event list a caller already has in memory (the same `on_event` collection pattern `simulation/uds/tests/test_uds_integration.py` already uses) -- a dashboard backend (Phase 10) is the natural place to eventually hold that state, not the analyzer itself. |
 | `repeated_p0217_activity` capped at `warning`, not `critical` | Avoids overstating what a POC rule reading a static, illustrative DTC list actually knows -- see docs/analyzer-spec.md's "Avoiding exaggerated claims" section. Severity reflects the analyzer's own confidence, not the seriousness a real overtemperature condition would warrant. |
 | LLM explanation layer uses the `anthropic` SDK directly, gated by `ANTHROPIC_API_KEY` | Consistent with this project only ever using official/lightweight SDKs for a single, well-defined job (paho-mqtt for MQTT, Terraform for AWS provisioning). No key set -- the default, including in CI -- means `explain_anomaly()` returns `None` immediately without importing `anthropic` or attempting a network call; the deterministic rules and all of `DiagnosticAnalyzer` are entirely unaffected either way. |
+| Runtime standardized on Python 3.11 everywhere, not silently moved to a newer local interpreter | `.github/workflows/ci.yml` and `docker/Dockerfile` both pin `3.11` explicitly; README.md's "Requirements" section says so too. A developer whose own machine reports a different Python version (e.g. 3.14) is expected to use Docker or a `python3.11` interpreter directly, rather than the project quietly re-targeting whatever is locally installed -- reproducibility matters more here than convenience for one contributor's machine. |
+| One `app` container runs `run_demo.py` unmodified; no separate simulator/gateway containers | `python-can`'s virtual bus is process-local (the same Phase 1 finding behind "Edge Gateway runs in the same process as the ECUs," above) -- it doesn't survive a process boundary, let alone a container boundary. `docker/Dockerfile`'s `CMD` is the existing entry point, not a new one invented for Docker. |
+| `docker-compose.yml`'s `app` service depends on Mosquitto's healthcheck, not just container start | `MqttPublisher.connect()` is a synchronous call that raises if the broker isn't yet accepting connections -- Compose's default `depends_on` (container *started*, not *ready*) would make `app` crash on a cold `docker compose up` the moment Mosquitto's own startup is slower than usual. A `mosquitto_pub`-based healthcheck plus `condition: service_healthy` closes that race without touching application code. |
+| AWS IoT Core is never modeled as a Compose service | It's a real external AWS resource (see section 7), not a local process this project could stand up in a container -- adding a fake "aws-iot" container would misrepresent the architecture. `app`'s `AWS_IOT_*` environment variables are all unset (blank) by default in `docker-compose.yml`, which keeps it talking to the real `mosquitto` service exactly like every other local run. |
+| CI keeps installing Mosquitto via `apt-get`, not via Docker-in-Docker | Reconfirmed, not redesigned, during the reproducibility pass: GitHub-hosted runners don't guarantee a working Docker daemon, but `apt-get install mosquitto` reliably starts it as a systemd service. This is the same broker mechanism `docker/docker-compose.yml` provides for local dev -- just started a different way -- so CI still runs the real `mosquitto_broker`-fixture tests, not just the ones that skip without a broker. Confirmed by running the suite with and without a broker present: 154 passed/7 skipped without one, 160 passed/1 skipped (the AWS smoke test) with one. |
+| `python -m compileall` added as a CI step before dependency installation | A plain syntax error fails in seconds, before the slower `apt-get`/`pip install` steps run -- "lightweight syntax/import check" from the reproducibility requirements, kept genuinely lightweight (no extra dependency, no import of third-party packages) rather than a second, redundant test runner. |
+| No Dockerfile `HEALTHCHECK`, no dashboard/API port exposed | `app` is an MQTT *client*, not a server -- it has no port for anything to connect to, and nothing external polls its health (Compose's `restart: on-failure` is the safety net if it crashes). Keeps the image to exactly what running `run_demo.py` needs, per this pass's "avoid unnecessary complexity" constraint. |
 
 ## 4. Target repository structure
 
@@ -194,8 +215,11 @@ edge-to-cloud-automotive-telemetry-poc/
 ├── dashboard/                           [Phase 10: backend/ (REST+WebSocket), frontend/]
 ├── scenarios/resilience_demo.py         [Phase 9]
 ├── run_demo.py                          [Phase 3 — ECUs + gateway together — done]
-├── docker/docker-compose.yml            [Phase 3 — local Mosquitto — done; grows each phase]
-└── .github/workflows/ci.yml             [Phase 1 — minimal, grows every phase — done]
+├── docker/
+│   ├── docker-compose.yml               [Phase 3 — local Mosquitto — done; extended in the reproducibility/Docker/CI pass to add the `app` service — done]
+│   └── Dockerfile                       [reproducibility/Docker/CI pass — Python 3.11, runs run_demo.py — done]
+├── .dockerignore                        [reproducibility/Docker/CI pass — done]
+└── .github/workflows/ci.yml             [Phase 1 — minimal, grows every phase — extended in the reproducibility/Docker/CI pass (syntax-check step) — done]
 ```
 
 ## 5. Phase plan
@@ -258,3 +282,73 @@ this project assumes: no real vehicle hardware or CAN bus is involved;
 AWS resources are provisioned and torn down by the developer, not
 continuously running; and the LLM analyzer is advisory only and is never
 the sole basis for a safety- or correctness-relevant decision.
+
+## 9. Reproducibility, Docker & CI/CD
+
+A cross-cutting pass (see the "Naming note" under Status, above) made the
+repository, as it stood after Phase 6, reproducible on any machine and
+enforced by CI on every push/PR — without changing any application code,
+architecture, or the phase-numbered feature list.
+
+**Python version.** Standardized on **3.11** everywhere a version is
+specified: `.github/workflows/ci.yml` (`actions/setup-python@v5`),
+`docker/Dockerfile` (`FROM python:3.11-slim`), and README.md's
+"Requirements" section. Nothing was changed to match a *local*
+interpreter version (this project's own sandbox reports Python 3.14 in
+one environment, 3.10 in another) — those local differences are exactly
+why this standardization matters, and application code was not touched
+just to satisfy one machine's installed version.
+
+**Docker's role.** `docker/Dockerfile` builds a single image that runs
+the existing `run_demo.py` entry point unmodified (no invented
+entrypoint) — the 3 simulated ECUs and the Edge Gateway, together, as
+threads in one process/container, because `python-can`'s virtual CAN bus
+only shares frames within one OS process (see section 3's decision table
+and `docker/Dockerfile`'s own comments). The image runs as a non-root
+user, takes all configuration from environment variables (AWS IoT
+Core/Anthropic settings; see `.env.example`), contains no secrets, and
+exposes no ports (it is an MQTT client, not a server). `docker compose -f
+docker/docker-compose.yml up --build` builds and runs it alongside
+Mosquitto — see README.md's "Run with Docker" section.
+
+**GitHub Actions' role.** `.github/workflows/ci.yml` runs on every push
+and pull request to `main`, on GitHub-hosted Ubuntu: checkout → Python
+3.11 → a fast `python -m compileall` syntax check → `pip install -r
+requirements.txt` → install and start Mosquitto via `apt-get` (a real,
+running broker, not a mock — see section 3) → `pytest -v`. It does not
+build the Docker image (kept out of scope deliberately — pytest is the
+thing that needs to run on every change; a slower Docker build adds CI
+time without adding test coverage the pytest run doesn't already provide,
+and can be added later if a genuine need arises).
+
+**Local Mosquitto vs. AWS IoT Core, restated for this pass.** Both remain
+exactly as Phase 5 left them: local Mosquitto (via `docker/docker-
+compose.yml`, `apt-get`, or now also the `app`+`mosquitto` Compose pair)
+is the default and everything CI/Docker exercises; AWS IoT Core is a real
+external AWS service that this pass explicitly does *not* model as a
+container or mock — `docker-compose.yml`'s `app` service simply leaves
+every `AWS_IOT_*` variable unset by default, the same "no AWS
+configuration -> local Mosquitto" behavior `cloud_publisher.py` has had
+since Phase 5.
+
+**What CI actually proves vs. what needs real AWS credentials.** With
+Mosquitto installed, CI runs the full suite against a real local broker:
+159 unit/integration tests covering the simulator, UDS diagnostics, Edge
+Gateway ingest/validate/normalize/publish, buffering/backoff/replay
+resilience, fault injection, and the deterministic analyzer rules, plus
+`analyzer/tests/test_llm_explainer.py`'s tests (all of which inject a
+fake Anthropic client — none make a real API call). Exactly one test
+(`edge_gateway/tests/test_aws_iot_integration.py`'s AWS smoke test) is
+`skipif`-guarded on real `AWS_IOT_*` environment variables and therefore
+always skips in CI, by design — proving actual connectivity to AWS IoT
+Core requires real provisioned resources and real credentials, which is
+inherently something only a run against a live AWS account can
+demonstrate, not something CI should fake.
+
+**Security, reaffirmed, not newly introduced:** no AWS credentials or
+Anthropic API key anywhere in `docker/Dockerfile`, `docker/docker-
+compose.yml`, or `.github/workflows/ci.yml` — both are environment-variable
+based and unset by default; `.gitignore` already covered `.env`,
+`*.pem`/`*.crt`/`*.key`, and `infra/certs/` before this pass, and
+`.dockerignore` (new) keeps the same categories out of the Docker build
+context too.
