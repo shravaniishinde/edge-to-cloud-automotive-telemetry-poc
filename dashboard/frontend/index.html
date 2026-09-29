@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Telemetry Engineering Dashboard</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <div class="brand-title">Edge-to-Cloud Telemetry</div>
+    <div class="brand-sub">Engineering dashboard · read-only view of the live pipeline</div>
+  </div>
+  <div class="pills">
+    <span class="pill" id="pill-stream">dashboard: connecting…</span>
+    <span class="pill" id="pill-broker">broker: –</span>
+    <span class="pill" id="pill-flow">telemetry: –</span>
+    <span class="pill" id="pill-resilience">resilience: –</span>
+  </div>
+</header>
+
+<main>
+  <!-- 1. SYSTEM STATUS -->
+  <section class="panel span-12">
+    <h2>System status</h2>
+    <div class="grid status-grid">
+      <div class="card"><div class="card-label">Gateway (hosted by dashboard)</div><div class="card-value" id="gw-state">–</div><div class="card-meta" id="gw-meta"></div></div>
+      <div class="card"><div class="card-label">Current gateway session_id</div><div class="card-value mono small" id="gw-session">–</div><div class="card-meta" id="gw-session-meta"></div></div>
+      <div class="card"><div class="card-label">Gateway → MQTT</div><div class="card-value" id="gw-mqtt">–</div><div class="card-meta" id="gw-mqtt-meta"></div></div>
+      <div class="card"><div class="card-label">Telemetry flow (received via MQTT)</div><div class="card-value" id="flow-state">–</div><div class="card-meta" id="flow-meta"></div></div>
+      <div class="card"><div class="card-label">Vehicles seen</div><div class="card-value" id="vehicle-count">–</div><div class="card-meta" id="sessions-meta"></div></div>
+      <div class="card"><div class="card-label">Dashboard subscription</div><div class="card-value" id="broker-state">–</div><div class="card-meta" id="broker-meta"></div></div>
+    </div>
+  </section>
+
+  <!-- 2. GATEWAY METRICS -->
+  <section class="panel span-12">
+    <h2>Gateway metrics <span class="hint" id="metrics-source">GatewayMetrics snapshot (cumulative since the run started)</span></h2>
+    <div class="grid metrics-grid">
+      <div class="metric"><div class="metric-label">Processed</div><div class="metric-value" id="m-processed">–</div><div class="metric-note">live publishes acked by broker</div></div>
+      <div class="metric"><div class="metric-label">Rejected</div><div class="metric-value" id="m-rejected">–</div><div class="metric-note">failed validation</div></div>
+      <div class="metric warn"><div class="metric-label">Publish failures</div><div class="metric-value" id="m-publish_failures">–</div><div class="metric-note">live publish not acked</div></div>
+      <div class="metric warn"><div class="metric-label">Buffered</div><div class="metric-value" id="m-buffered">–</div><div class="metric-note">cumulative, written to SQLite</div></div>
+      <div class="metric good"><div class="metric-label">Replayed</div><div class="metric-value" id="m-replayed">–</div><div class="metric-note">buffered, later acked</div></div>
+      <div class="metric bad"><div class="metric-label">Dropped</div><div class="metric-value" id="m-dropped">–</div><div class="metric-note">buffer full, oldest dropped</div></div>
+      <div class="metric accent"><div class="metric-label" id="m-depth-label">Buffer depth (now)</div><div class="metric-value" id="m-depth">–</div><div class="metric-note" id="m-depth-note">rows in SQLite right now</div></div>
+      <div class="metric"><div class="metric-label">Receive rate</div><div class="metric-value" id="m-rate">–</div><div class="metric-note">events/s seen via MQTT (10 s)</div></div>
+    </div>
+    <div class="subtle" id="last-summary"></div>
+  </section>
+
+  <!-- 7. RESILIENCE + 8. CONTROLS -->
+  <section class="panel span-8">
+    <h2>Resilience / buffer status</h2>
+    <ol class="lifecycle" id="lifecycle"></ol>
+    <div class="lifecycle-detail" id="lifecycle-detail">–</div>
+    <div class="subtle" id="replay-info"></div>
+    <div class="subtle" id="external-buffer"></div>
+  </section>
+
+  <section class="panel span-4">
+    <h2>Demo controls</h2>
+    <p class="subtle">Known actions only. They start existing components in the dashboard process; they don't reimplement them.</p>
+    <div class="buttons">
+      <button data-action="live/start">Start live demo</button>
+      <button data-action="live/stop" class="secondary">Stop live demo</button>
+      <button data-action="outage/inject" class="danger">Inject MQTT outage</button>
+      <button data-action="outage/clear" class="secondary">Clear outage</button>
+      <button data-action="resilience/run" class="secondary">Run scripted resilience check</button>
+      <button data-action="diagnostics/run" class="secondary">Run UDS diagnostic session</button>
+    </div>
+    <div class="toast" id="toast"></div>
+    <div class="subtle" id="scripted-result"></div>
+  </section>
+
+  <!-- 3. LIVE TELEMETRY -->
+  <section class="panel span-12">
+    <h2>Live telemetry
+      <label class="hint">vehicle <select id="vehicle-select"></select></label>
+    </h2>
+    <div class="grid charts-grid" id="charts"></div>
+    <div class="table-wrap"><table id="latest-table"><thead><tr><th>ECU</th><th>Signal</th><th class="num">Value</th><th>Unit</th><th>Event timestamp</th><th>event_id</th></tr></thead><tbody></tbody></table></div>
+    <div class="empty" id="telemetry-empty">No telemetry received yet. Start the live demo, or run <code>python run_demo.py</code> against the same broker.</div>
+  </section>
+
+  <!-- 4. VEHICLES / ECUs -->
+  <section class="panel span-6">
+    <h2>Vehicles / ECUs</h2>
+    <div class="table-wrap"><table id="vehicles-table"><thead><tr><th>vehicle_id</th><th>ECU</th><th class="num">Events</th><th>Last seen</th><th>Latest values</th></tr></thead><tbody></tbody></table></div>
+  </section>
+
+  <!-- 5. DIAGNOSTICS -->
+  <section class="panel span-6">
+    <h2>Diagnostics / anomalies</h2>
+    <div class="subtle" id="diag-status">Not run yet. Use “Run UDS diagnostic session”.</div>
+    <h3>Deterministic rule findings</h3>
+    <div class="table-wrap"><table id="anomaly-table"><thead><tr><th>Severity</th><th>Rule</th><th>Finding</th><th class="num">Events</th><th>LLM explanation</th></tr></thead><tbody></tbody></table></div>
+    <h3>UDS diagnostic events</h3>
+    <div class="table-wrap short"><table id="diag-table"><thead><tr><th>Time</th><th>Service</th><th>Request</th><th>Response</th><th>Result</th></tr></thead><tbody></tbody></table></div>
+  </section>
+
+  <!-- 6. EVENT STREAM -->
+  <section class="panel span-12">
+    <h2>Event stream <span class="hint">latest 50 received events (live, replayed, or late)</span></h2>
+    <div class="table-wrap tall"><table id="events-table"><thead><tr><th>Event time</th><th>Status</th><th class="num">Lag s</th><th>vehicle_id</th><th>Source / signal</th><th class="num">Value</th><th>event_id</th><th>session_id</th><th>Topic</th></tr></thead><tbody></tbody></table></div>
+  </section>
+
+  <!-- 9. ACTIVITY -->
+  <section class="panel span-12">
+    <h2>Activity <span class="hint">gateway structured logs (in-process runs) and dashboard events; repeats coalesced</span></h2>
+    <div class="table-wrap tall"><table id="activity-table"><thead><tr><th>Time</th><th>Level</th><th>Source</th><th>Message</th><th class="num">×</th><th>Details</th></tr></thead><tbody></tbody></table></div>
+  </section>
+
+  <section class="panel span-12">
+    <h2>Run it from a terminal</h2>
+    <pre class="cmd">docker compose -f docker/docker-compose.yml up -d mosquitto   # local broker
+python -m dashboard.backend                                   # this dashboard (http://127.0.0.1:8080)
+python run_demo.py --duration 60                              # external gateway: telemetry appears via MQTT
+python -m scenarios.resilience_demo                           # scripted outage → buffering → FIFO replay check</pre>
+    <p class="subtle">External gateways (another terminal, or the Compose <code>app</code> container) are observed through their MQTT telemetry only. Their GatewayMetrics live in that other process, so the metrics panel shows only runs hosted here. Pass <code>--external-buffer edge_gateway/data/buffer.db</code> to also watch run_demo.py's buffer depth, read-only.</p>
+  </section>
+</main>
+</body>
+</html>

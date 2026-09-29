@@ -1,7 +1,7 @@
 # Architecture & Phase Plan
 
-Status: Phases 0-9 complete (Phase 8 was done before Phase 7 -- see the
-Phase 7/8 ordering note below); Phases 10-11 not started. Implementation proceeds phase by phase; each
+Status: Phases 0-10 complete (Phase 8 was done before Phase 7 -- see the
+Phase 7/8 ordering note below); Phase 11 not started. Implementation proceeds phase by phase; each
 phase is reviewed before the next begins. This document is the single
 source of truth for *why* the system is shaped the way it is — update it
 whenever a phase changes or adds a decision.
@@ -71,7 +71,8 @@ stays reasonable for a personal project.
                       |
         IoT Rule -> CloudWatch Logs + Metrics
                       |
-   (later) Dashboard backend (REST + WebSocket) reads gateway state directly
+   Engineering Dashboard (Phase 10): read-only MQTT subscriber + gateway runs hosted
+   in its own process -> stdlib HTTP + Server-Sent Events -> browser (section 12)
 ```
 
 **Correction found during Phase 1 planning:** `python-can`'s virtual
@@ -124,8 +125,10 @@ developer's own machine or CI). See `docs/edge-gateway-spec.md`.
 - **Analyzer** — a deterministic rule engine that performs the actual
   anomaly detection, plus an LLM pass that only explains/summarizes what
   the rules already flagged.
-- **Dashboard** (added last) — reads the Edge Gateway's own live state
-  (not AWS, not fabricated data) over REST/WebSocket.
+- **Dashboard** (Phase 10) — reads the Edge Gateway's own live state
+  (not AWS, not fabricated data): telemetry via a read-only MQTT
+  subscription, metrics from gateway runs it hosts in its own process,
+  served over plain HTTP + Server-Sent Events.
 
 ## 3. Key technical decisions and rationale
 
@@ -158,7 +161,7 @@ developer's own machine or CI). See `docs/edge-gateway-spec.md`.
 | Real-broker integration tests connect to an already-running broker, not spawn one themselves | `edge_gateway/tests/conftest.py`'s fixture just checks `localhost:1883` (overridable via `MQTT_BROKER_HOST`/`MQTT_BROKER_PORT`) is reachable and skips if not, rather than owning a broker's lifecycle. `docker/docker-compose.yml` is the one broker mechanism for local dev, manual demos, and CI alike -- CI provides its own equivalent broker by installing the `mosquitto` package, which starts it as a systemd service, since GitHub-hosted runners don't guarantee a working Docker daemon. |
 | Reconnect is paced by the gateway's own loop, not a dedicated thread | `try_reconnect()` is a cheap timestamp check most of the time, gated by exponential backoff (1s, doubling, capped at 30s); `EdgeGateway.run_once()` calls it once per iteration. Keeps retry timing simple and explainable without adding a second thread's worth of lifecycle/shutdown concerns for what a POC needs. |
 | Buffer replay stops at the first unconfirmed row instead of skipping ahead | Preserves strict FIFO ordering -- correct for time-series signals -- at the cost of one slow/failing event blocking everything behind it until it either confirms or the connection drops again. Accepted: correctness of order matters more here than replay throughput. |
-| Delivery guarantee is at-least-once, not exactly-once | A buffered row is deleted only after a real broker PUBACK (verified from paho-mqtt's own source, not assumed); the accepted gap is a possible duplicate replay if the process crashes between that acknowledgement and the delete. Closing that gap fully needs a distributed transaction this POC doesn't need to demonstrate. |
+| Delivery guarantee is at-least-once, not exactly-once | A buffered row is deleted only after a real broker PUBACK (verified from paho-mqtt's own source, not assumed); the accepted gap is a possible duplicate replay if the process crashes between that acknowledgement and the delete. Closing that gap fully needs a distributed transaction this POC doesn't need to demonstrate. (Phase 10 manual testing also observed duplicates during a *real* broker outage, with no crash -- see `docs/assumptions-and-limitations.md`, Phase 10 section; still within at-least-once, not yet root-caused.) |
 | Fault injection is 4 named scenarios, not a chaos framework | Deterministic and interview-explainable: force N publish failures, a malformed frame, an out-of-range frame, plus a real `docker compose stop` for the actual outage demo. A randomized chaos-monkey approach would add flakiness and complexity with no corresponding teaching value at this scale. |
 | AWS IoT Core support extends `MqttPublisher` with optional TLS args, not a second publisher class | AWS IoT Core is plain MQTT over TLS -- the exact protocol `MqttPublisher` already speaks. Adding `tls_ca_certs`/`tls_certfile`/`tls_keyfile` as optional constructor args (all-or-nothing, or a `ValueError`) keeps exactly one publish/reconnect/backoff implementation, unchanged from Phase 4, rather than duplicating that logic in a `CloudPublisher` subclass. No new AWS SDK dependency is needed as a result. |
 | Local-vs-AWS selection lives in `edge_gateway/cloud_publisher.py`, not in `gateway.py` or CLI flags | `EdgeGateway` still just receives an already-constructed `MqttPublisher` -- it has no idea, and doesn't need to know, whether that publisher is talking to Mosquitto or AWS IoT Core. Reading environment variables and deciding which to build is a separate, independently testable concern. |
@@ -224,7 +227,7 @@ edge-to-cloud-automotive-telemetry-poc/
 │   ├── analyzer.py                      [Phase 6 — DiagnosticAnalyzer orchestrator, AnalyzerConfig — done]
 │   ├── llm_explainer.py                 [Phase 6 — optional advisory explanation layer — done]
 │   └── tests/                           [Phase 6 — done]
-├── dashboard/                           [Phase 10: backend/ (REST+WebSocket), frontend/]
+├── dashboard/                           [Phase 10 — backend/ (stdlib HTTP + SSE, MQTT subscriber, demo controls), frontend/ (HTML/CSS/JS), tests/ — done]
 ├── scenarios/resilience_demo.py         [Phase 9 — self-verifying outage/recovery demo, tests in scenarios/tests/ — done]
 ├── run_demo.py                          [Phase 3 — ECUs + gateway together — done]
 ├── docker/
@@ -248,7 +251,7 @@ edge-to-cloud-automotive-telemetry-poc/
 | 7 | Observability — **done** (after Phase 8; see note above) | `edge_gateway/metrics.py`, correlation IDs finalized end-to-end (`session_id` = run-level correlation ID, `event_id` = per-event identity) |
 | 8 | Testing & CI hardening — **done** | full pytest suite, one full-scenario integration test (`edge_gateway/tests/test_full_scenario_integration.py`), expanded CI, finalized `assumptions-and-limitations.md` |
 | 9 | Resilience demo — **done** | `scenarios/resilience_demo.py`, `scenarios/tests/`, `simulated_connection_outage()` in `edge_gateway/fault_injection.py` |
-| 10 | Engineering Dashboard | `dashboard/backend/`, `dashboard/frontend/` |
+| 10 | Engineering Dashboard — **done** | `dashboard/backend/`, `dashboard/frontend/`, `dashboard/tests/`, optional `dashboard` Compose service |
 | 11 | Final docs & polish | architecture diagram, interview talking-points doc |
 
 Each phase follows: **PLAN → EXPLAIN → IMPLEMENT → VERIFY → DOCUMENT**, and
@@ -459,3 +462,72 @@ original timestamps. Replayed payloads must keep their original
 `event_id` and the `session_id` of the run that buffered them. The final
 `MetricsSnapshot` must agree with the observed counts. Delivery remains
 at-least-once; duplicates are reported, not suppressed.
+
+## 12. Engineering Dashboard (Phase 10)
+
+A read/visualization layer. It adds no stage to the telemetry pipeline
+and never publishes telemetry, buffers, replays, or changes gateway
+behaviour.
+
+```
+existing gateway(s) --MQTT vehicle/+/telemetry/+/+ (TelemetryEvent JSON)--> TelemetrySubscriber --+
+gateway run hosted in the dashboard process:                                                   |
+   GatewayMetrics.metrics_snapshot() + publisher.is_connected() ----------> DemoController ------+--> DashboardState
+   "edge_gateway" structured log records ----------------------------------> LogTap --------------+   (bounded, in memory)
+   SQLite buffer file (separate read-only connection, COUNT(*)) ----------> buffer depth ---------+        |
+UDS client/server over the VirtualBus -> DiagnosticAnalyzer.analyze() ---> diagnostics ----------+        v
+                                              stdlib ThreadingHTTPServer: /api/state, /api/stream (SSE, 1 s)
+                                                                                    -> browser (plain JS, SVG charts)
+```
+
+**Why the dashboard hosts gateway runs.** `GatewayMetrics` exists only
+inside the process running the gateway, and the VirtualBus is
+process-local, so a separate dashboard process cannot read another
+process's metrics without changing the pipeline (e.g. publishing metrics
+over MQTT), which Phase 10 deliberately avoids. The dashboard therefore
+(a) shows telemetry from *any* gateway via MQTT, and (b) offers a "live
+demo" that runs the `run_demo.py` wiring in its own process, where the
+real metrics, connection state, and log records are readable. Other
+gateways' metrics are shown as unavailable, never estimated.
+
+**Demo controls** are a fixed allowlist (`dashboard/backend/controls.py`
+`ACTIONS`). Each only starts or stops existing components: the live
+demo, `simulated_connection_outage()` (Phase 9 fault injection), the
+Phase 9 `run_scenario()`, and a fixed UDS script through
+`PowertrainUDSServer`/`UDSTester` plus `DiagnosticAnalyzer` (no LLM
+call). Only one gateway run (live demo or scripted check) at a time,
+since both share the VirtualBus channel.
+
+**Resilience lifecycle derivation** (`derive_resilience_state`):
+
+| Observed | State |
+|---|---|
+| no hosted run | IDLE |
+| publisher disconnected, buffer empty | OUTAGE |
+| disconnected, rows buffered, dashboard cleared its injected outage | RECONNECTING |
+| disconnected, rows buffered (otherwise) | BUFFERING |
+| connected, rows buffered, a replay batch logged in the last 3 s | REPLAYING |
+| connected, rows buffered, no recent replay | BUFFERING (buffered rows wait for the next reconnect/restart) |
+| connected, buffer empty, events replayed this run | RECOVERED |
+| connected, buffer empty, nothing replayed | NORMAL |
+
+"Connected" alone is never taken as evidence of replay: during a real
+`docker compose stop mosquitto`, the publisher can report connected
+while publishes fail. That was observed during this phase's manual
+testing and is why the REPLAYING row requires recent replay activity.
+
+**Transport and security.** Standard-library `http.server` with Server-Sent
+Events (one snapshot per second per open page), with no web framework
+and no new dependency. The server binds to 127.0.0.1 by default. Only
+allowlisted static files are served, and a strict Content-Security-Policy
+applies. POST actions require an `X-Dashboard-Action` header, which a
+cross-origin page cannot send without a CORS preflight the server never
+grants. Log fields reach the browser only through an allowlist. The
+browser renders everything via `textContent`. There is no authentication,
+so the dashboard is for localhost; the Compose service publishes its
+port on 127.0.0.1 only.
+
+**Memory is bounded** (`dashboard/backend/state.py`): 200 recent events,
+200 activity entries, 20 vehicles, 120 chart points per signal (at most
+one per 0.5 s of event time), 5,000 remembered event_ids for duplicate
+detection, and 100 diagnostic events / 50 findings from the last run.

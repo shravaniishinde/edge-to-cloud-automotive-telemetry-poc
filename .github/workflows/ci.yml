@@ -27,7 +27,7 @@ jobs:
       # parses -- it needs no third-party packages, so it works even if a
       # dependency install is about to fail for an unrelated reason.
       - name: Syntax check
-        run: python -m compileall -q common edge_gateway simulation analyzer scenarios run_demo.py conftest.py
+        run: python -m compileall -q common edge_gateway simulation analyzer scenarios dashboard run_demo.py conftest.py
 
       # actions/setup-python provides its own isolated Python install, so
       # (unlike the externally-managed system Python used for local dev in

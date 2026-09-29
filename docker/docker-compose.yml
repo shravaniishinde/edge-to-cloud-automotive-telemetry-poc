@@ -21,6 +21,11 @@
 #   # Ctrl+C to stop, or in another terminal:
 #   docker compose -f docker/docker-compose.yml stop mosquitto   # Phase 4 outage demo
 #   docker compose -f docker/docker-compose.yml start mosquitto
+#
+# Phase 10: an optional `dashboard` service, behind the "dashboard" profile
+# so plain `docker compose up` is unchanged:
+#   docker compose -f docker/docker-compose.yml --profile dashboard up --build
+#   # then open http://127.0.0.1:8080
 services:
   mosquitto:
     image: eclipse-mosquitto:2
@@ -69,4 +74,24 @@ services:
       # Optional Phase 6 advisory LLM layer -- unset by default. Never
       # required for the gateway/analyzer core to run.
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    restart: on-failure
+
+  dashboard:
+    # Read/visualization layer (Phase 10, see ARCHITECTURE.md section 12):
+    # subscribes to Mosquitto's telemetry topics (so it also shows the `app`
+    # service's SIM-VEHICLE-01 telemetry) and can host its own demo runs.
+    # Same image as `app`, different command. Needs no AWS or Anthropic
+    # configuration, and none is passed in.
+    profiles: ["dashboard"]
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+    command: ["python", "-m", "dashboard.backend", "--host", "0.0.0.0", "--port", "8080", "--mqtt-host", "mosquitto"]
+    ports:
+      # Published on the host's loopback only: the dashboard has demo
+      # controls and no authentication, so it is not exposed to the network.
+      - "127.0.0.1:8080:8080"
     restart: on-failure

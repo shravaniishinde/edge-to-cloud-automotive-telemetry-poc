@@ -489,3 +489,81 @@ Phase 7 was implemented after Phase 8, on top of the audit above.
 - **Test cost.** The broker-backed demo tests run the real threads with
   smaller event counts and take roughly 5 s each; together they roughly
   double the broker-backed suite's run time (still well under a minute).
+
+## Assumptions and limitations added in Phase 10 (Engineering Dashboard)
+
+- **Metrics only for gateways the dashboard hosts.** `GatewayMetrics`,
+  the gateway's MQTT connection state, and its structured log records
+  exist only inside the process running that gateway. The dashboard
+  shows them for runs it hosts (its "live demo", which uses the
+  `run_demo.py` wiring, and the scripted Phase 9 check). Gateways in
+  other processes (`python run_demo.py`, the Compose `app` container)
+  are visible through their MQTT telemetry and payload `session_id`s
+  only. Their metrics are shown as unavailable rather than estimated.
+  Buffer depth of such a gateway can be read from its SQLite file
+  (`--external-buffer`), read-only.
+- **The resilience lifecycle is derived, not reported by the gateway.**
+  It comes from the publisher's connection flag, the SQLite row count,
+  recent replay log lines, and whether the dashboard itself injected or
+  cleared the simulated outage (see ARCHITECTURE.md section 12). For a
+  real broker outage the dashboard cannot know when the broker is back,
+  so it shows BUFFERING until replay starts, never RECONNECTING.
+- **Observed during manual testing: the publisher can report "connected"
+  during a real broker outage.** With `docker compose stop mosquitto` on
+  Docker Desktop (Windows), the hosted gateway's `is_connected()` stayed
+  true while publishes failed and the buffer grew. `try_reconnect()` marks
+  the publisher connected once `client.reconnect()` returns, before any
+  CONNACK, and Docker Desktop's port proxy accepts the TCP connection
+  even with the container stopped. The gateway still buffered everything
+  and replayed it all in FIFO order once the broker returned (591 of 591
+  and 2,454 of 2,454 in two runs). This is existing Phase 4 behaviour and
+  was not changed in Phase 10. The dashboard was adjusted so it doesn't
+  mislabel this state as REPLAYING.
+- **Observed during manual testing: duplicate deliveries after a real
+  broker outage.** In the same real-outage run the dashboard counted
+  1,181 duplicate `event_id`s for 591 buffered events. That's roughly
+  two extra copies per buffered event, with no process crash. This goes
+  beyond the crash-window duplicate described in the Phase 4 entry
+  above, though it is still within at-least-once delivery. Likely cause,
+  not yet root-caused: paho-mqtt keeps QoS 1 messages it could not
+  deliver and re-sends them after reconnecting, while the gateway has
+  already counted those publishes as failed, buffered them, and replays
+  them too. The simulated outage (Phase 9) does not show this, because
+  `publish()` returns before handing anything to paho. The gateway was
+  not changed in Phase 10; the dashboard's `duplicates` counter makes
+  the effect visible.
+- **Subscriber-side view.** "Telemetry flow", receive rate, duplicates,
+  and the event stream reflect what the dashboard's own MQTT
+  subscription received (QoS 1, clean session). Messages published while
+  the dashboard was disconnected from the broker are not seen by it.
+  "Late" means an event arrived more than 2 s after its own timestamp;
+  "replayed" is only known for hosted runs (from the gateway's replay
+  log line). Duplicates are counted, never hidden: every delivery
+  appears in the event stream and the counts. The `duplicates` figure
+  is a lower bound, because only the last 5,000 `event_id`s are
+  remembered.
+- **Bounded history, no persistence.** Everything is in memory with fixed
+  caps (ARCHITECTURE.md section 12) and is lost when the dashboard stops.
+  Chart history is at most 120 points per signal. Vehicles beyond 20 are
+  evicted least-recently-seen first.
+- **Diagnostics are on demand.** No live diagnostic stream exists in the
+  pipeline, so "Run UDS diagnostic session" runs a fixed UDS script over
+  the VirtualBus (session control, VIN, speed, RPM, 3 DTC reads, 3
+  unsupported-DID reads) and applies the deterministic rules to that
+  run's events. It is designed to exercise all three rules, so the
+  findings illustrate the rules rather than detect a real fault. The LLM
+  explainer is never called.
+- **One hosted gateway run at a time.** The live demo and the scripted
+  resilience check both use the process-local VirtualBus, and the
+  scripted check's verification reads every gateway log record, so the
+  dashboard refuses to run them together.
+- **Local, unauthenticated.** The dashboard binds to 127.0.0.1 by default
+  and has no login. POST actions need a custom header, which blocks
+  simple cross-site requests but is not authentication. The optional
+  Compose service publishes port 8080 on the host's loopback only. The
+  dashboard uses local Mosquitto and never reads AWS or Anthropic
+  configuration.
+- **No browser-level automated test.** API, SSE, static-file, and data-path
+  behaviour are tested with a real server. The page itself was checked
+  manually in a browser (live demo, outage/recovery, diagnostics), not by
+  an automated UI test.

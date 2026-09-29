@@ -44,5 +44,10 @@ anthropic==1.5.0        # OPTIONAL advisory explanation layer only (analyzer/llm
                         # (analyzer/rules.py) has no dependency on this package at all -- it
                         # is imported nowhere outside llm_explainer.py. See docs/analyzer-spec.md.
 
-# Expected future additions (not yet installed):
-#   Phase 10 - fastapi, uvicorn (dashboard backend) - to be confirmed at that phase
+# --- Phase 10: Engineering Dashboard ---
+# No new dependency. The originally pencilled-in fastapi/uvicorn turned out
+# not to be needed: dashboard/backend/ uses the standard library's
+# http.server (ThreadingHTTPServer) with Server-Sent Events, paho-mqtt
+# (above) for its read-only telemetry subscription, and sqlite3 for a
+# read-only buffer-depth query; dashboard/frontend/ is plain HTML/CSS/JS
+# with no build step and no CDN.

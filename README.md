@@ -19,8 +19,9 @@ telemetry pipeline for a simulated small vehicle network.
   **LLM-based advisory log analyzer** — the LLM only explains/summarizes
   what the deterministic rules already flagged; it never makes the
   anomaly call itself.
-- Will later add a lightweight web dashboard that visualizes the real,
-  live state of the running system (no fabricated/demo data).
+- Includes a lightweight engineering web dashboard (Phase 10) that
+  visualizes the real, live state of the running system (no fabricated
+  data).
 
 ## What this project is NOT
 
@@ -37,9 +38,8 @@ phase reviewed before the next begins. See [ARCHITECTURE.md](ARCHITECTURE.md)
 for the full architecture, the phase plan, and the reasoning behind every
 major technical decision.
 
-**Current status: Phases 0–9 complete** (Phase 8 was done before
-Phase 7); Phase 10 (Engineering Dashboard) and Phase 11 (final docs/
-polish) are not started. The paragraphs below describe the most recent
+**Current status: Phases 0–10 complete** (Phase 8 was done before
+Phase 7); Phase 11 (final docs/polish) is not started. The paragraphs below describe the most recent
 phases in the order they were completed.
 
 **Phase 6 (diagnostic analyzer) complete** — a Diagnostic Anomaly Analyzer now
@@ -83,8 +83,13 @@ CloudWatch Metrics) is used.
 **Phase 9 (resilience demo) complete** — `python -m scenarios.resilience_demo`
 runs a self-verifying MQTT outage → SQLite buffering → reconnect → FIFO
 replay → recovery scenario against local Mosquitto and prints PASS/FAIL
-with real counts (see "Resilience demo" below). The Engineering Dashboard
-(Phase 10) and final docs/polish (Phase 11) are not started.
+with real counts (see "Resilience demo" below).
+
+**Phase 10 (Engineering Dashboard) complete** — `python -m dashboard.backend`
+serves a read-only engineering dashboard at http://127.0.0.1:8080: live
+telemetry, gateway metrics, the resilience lifecycle, vehicles/ECUs,
+the event stream, diagnostics and activity, plus a few safe demo
+controls (see "Engineering dashboard" below). No new dependencies.
 
 On top of that, this repository has also been made reproducible and
 CI/CD-ready: a `Dockerfile` and an extended `docker/docker-compose.yml`
@@ -193,6 +198,58 @@ Delivery is at-least-once, not exactly-once — the summary reports any
 duplicates rather than hiding them (none are expected in this controlled
 run). See [docs/assumptions-and-limitations.md](docs/assumptions-and-limitations.md)
 for what the simulated outage does and doesn't exercise.
+
+## Engineering dashboard (Phase 10)
+
+A read/visualization layer over the running system. It never publishes
+telemetry, buffers, replays, or changes the gateway; see ARCHITECTURE.md
+section 12 for the data flow.
+
+```bash
+docker compose -f docker/docker-compose.yml up -d mosquitto
+python -m dashboard.backend          # then open http://127.0.0.1:8080
+```
+
+What it shows, all derived from real data:
+
+- **System status:** gateway run state, the gateway `session_id`, the gateway's
+  MQTT connection, telemetry flow (flowing / stale / none), last event
+  time, vehicles and sessions seen, and the dashboard's own broker
+  subscription state.
+- **Gateway metrics:** the real `GatewayMetrics` snapshot (processed, rejected,
+  publish failures, buffered, replayed, dropped). These are cumulative
+  counters, shown separately from the *current* SQLite buffer depth and
+  the receive rate.
+- **Resilience lifecycle:** NORMAL → OUTAGE → BUFFERING → RECONNECTING →
+  REPLAYING → RECOVERED, plus the latest replay batch.
+- **Live telemetry:** charts of speed, RPM, SOC and pack current (60 s window,
+  units on the axes), and the latest value of all 11 signals.
+- **Vehicles / ECUs:** per-vehicle, per-ECU event counts and latest values.
+- **Event stream:** the latest 50 events with `event_id`, `session_id`, topic,
+  and status (live / replayed / late).
+- **Diagnostics:** a UDS session run over the virtual CAN bus through the
+  existing client/server, analyzed by the deterministic rules. No LLM
+  call is made; findings say so.
+- **Activity:** the gateway's own structured log lines (reconnects, buffering,
+  replay, "gateway stopped" summary), with repeats coalesced.
+
+**Demo controls** (fixed actions only; each drives existing components):
+start/stop a live demo (the `run_demo.py` wiring, hosted in the
+dashboard process), inject/clear the existing simulated MQTT outage, run
+the scripted Phase 9 resilience check, and run a UDS diagnostic session.
+
+Telemetry from gateways in *other* processes, such as `python run_demo.py` or
+the Compose `app` container, appears through MQTT. Their `GatewayMetrics`
+live in that other process, so the metrics and resilience panels only
+cover runs hosted by the dashboard. `--external-buffer
+edge_gateway/data/buffer.db` adds a read-only depth reading of
+run_demo.py's buffer.
+
+Options: `--host` (default 127.0.0.1), `--port` (8080), `--mqtt-host`,
+`--mqtt-port`, `--external-buffer`, `--show-logs`. In Docker:
+`docker compose -f docker/docker-compose.yml --profile dashboard up --build`
+(the port is published on 127.0.0.1 only). The dashboard has no
+authentication: keep it on localhost.
 
 ## Run with Docker
 
@@ -315,7 +372,7 @@ descriptions, configurable time windows, severity levels, known false
 positive/negative patterns, and exactly what the LLM layer is and isn't
 allowed to do.
 
-There is no dashboard to run yet — that arrives in a later phase. See
+See "Engineering dashboard" below for the Phase 10 visual view. See
 [ARCHITECTURE.md](ARCHITECTURE.md) for the full phase plan,
 [docs/can-signal-spec.md](docs/can-signal-spec.md) for exactly what the
 simulated vehicle transmits, [docs/uds-spec.md](docs/uds-spec.md) for the

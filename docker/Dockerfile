@@ -28,12 +28,16 @@ RUN pip install -r requirements.txt
 # Only what run_demo.py actually needs at runtime. Deliberately excluded:
 # tests/ (this image is not how tests are run -- see the CI workflow and
 # README.md's "CI/CD" section, which run pytest directly, not inside
-# Docker), docs/, infra/ (Terraform, a separate tool, not part of the
-# running application), and dashboard/ (does not exist yet -- Phase 10).
+# Docker), docs/, and infra/ (Terraform, a separate tool, not part of the
+# running application). Phase 10 adds scenarios/ and dashboard/ so the same
+# image can also run the optional `dashboard` Compose service
+# (`python -m dashboard.backend`); the default CMD below is unchanged.
 COPY common/ ./common/
 COPY simulation/ ./simulation/
 COPY edge_gateway/ ./edge_gateway/
 COPY analyzer/ ./analyzer/
+COPY scenarios/ ./scenarios/
+COPY dashboard/ ./dashboard/
 COPY run_demo.py .
 
 # Non-root user. The Edge Gateway's SQLite buffer (edge_gateway/data/) is
