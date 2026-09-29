@@ -3,7 +3,7 @@ Phase 4: deterministic, explicit fault-injection helpers -- not a random
 chaos-monkey framework, on purpose. A POC's fault injection should be a
 small set of named, on-demand scenarios that are easy to trigger, easy to
 test deterministically (no timing flakiness), and easy to explain in an
-interview. Four scenarios are covered here:
+interview. Five scenarios are covered here:
 
 - MQTT/cloud outage: `force_publish_failures()`, a context manager that
   makes MqttPublisher.publish() report failure without touching the
@@ -11,6 +11,15 @@ interview. Four scenarios are covered here:
   demo instead uses a genuine `docker compose stop mosquitto` (see
   run_demo.py / README.md), since Docker Compose is already this
   project's one broker mechanism -- no new tooling needed to fake it.
+- MQTT connection outage (Phase 9): `simulated_connection_outage()`.
+  `force_publish_failures()` leaves the publisher reporting "connected",
+  so the gateway never sees an outage and never runs its reconnect ->
+  replay path (buffered events would only replay at the next restart).
+  This one makes the gateway see a real-looking disconnect instead:
+  publishes fail, reconnect attempts fail with backoff, and when the
+  context exits the next backoff-gated reconnect succeeds and the
+  gateway replays its buffer in FIFO order -- all through existing
+  gateway/publisher code. Used by scenarios/resilience_demo.py.
 - Recovery after outage: simply the context manager exiting (or the
   broker actually restarting) -- EdgeGateway's own reconnect/replay logic
   (mqtt_publisher.py's try_reconnect(), gateway.py's _replay_buffered())
@@ -48,6 +57,20 @@ def force_publish_failures(publisher: MqttPublisher, count: int) -> Iterator[Non
         yield
     finally:
         publisher.clear_injected_failures()
+
+
+@contextmanager
+def simulated_connection_outage(publisher: MqttPublisher) -> Iterator[None]:
+    """Simulates the MQTT broker becoming unreachable for the duration
+    of the `with` block (see MqttPublisher.inject_connection_outage()).
+    On exit -- even if the block raises -- the outage is cleared, and the
+    gateway's own next backoff-gated try_reconnect() observes recovery
+    and triggers replay; nothing else needs to be "injected" for that."""
+    publisher.inject_connection_outage()
+    try:
+        yield
+    finally:
+        publisher.clear_connection_outage()
 
 
 def malformed_frame(can_id: int = 0x100) -> can.Message:

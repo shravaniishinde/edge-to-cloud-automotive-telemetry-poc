@@ -9,19 +9,25 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # The whole suite runs in well under a minute; this only exists so a
+    # thread that fails to shut down (e.g. a hung gateway/ECU loop in an
+    # integration test) fails the run quickly instead of burning the
+    # default 6-hour job limit.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: pip  # keyed on requirements.txt; speeds up reruns only, no behaviour change
 
       # Fast fail on a plain syntax error, in seconds, before spending
       # time on apt-get/pip below. This only checks that every .py file
       # parses -- it needs no third-party packages, so it works even if a
       # dependency install is about to fail for an unrelated reason.
       - name: Syntax check
-        run: python -m compileall -q common edge_gateway simulation analyzer run_demo.py
+        run: python -m compileall -q common edge_gateway simulation analyzer scenarios run_demo.py conftest.py
 
       # actions/setup-python provides its own isolated Python install, so
       # (unlike the externally-managed system Python used for local dev in
@@ -29,6 +35,13 @@ jobs:
       # here.
       - name: Install dependencies
         run: pip install -r requirements.txt
+
+      # Parses/validates docker/docker-compose.yml (no images are pulled
+      # or built, no containers run). Docker Compose ships preinstalled on
+      # GitHub's ubuntu runners, so this needs no Docker-in-Docker and adds
+      # only a couple of seconds.
+      - name: Validate Docker Compose file
+        run: docker compose -f docker/docker-compose.yml config --quiet
 
       # edge_gateway/tests/conftest.py's mosquitto_broker fixture connects
       # to an already-running broker at localhost:1883 -- it does not spawn
@@ -41,5 +54,27 @@ jobs:
       - name: Install Mosquitto broker
         run: sudo apt-get update && sudo apt-get install -y mosquitto
 
+      # Don't let the test run race the service's startup.
+      - name: Wait for Mosquitto on localhost:1883
+        run: |
+          for _ in $(seq 1 20); do
+            if (echo > /dev/tcp/127.0.0.1/1883) 2>/dev/null; then echo "Mosquitto is up"; exit 0; fi
+            sleep 0.5
+          done
+          echo "Mosquitto did not start listening on 1883" >&2
+          sudo systemctl status mosquitto --no-pager || true
+          exit 1
+
+      # MQTT_BROKER_REQUIRED=1 turns "broker unreachable" from a skip into
+      # a failure (see edge_gateway/tests/conftest.py), so the real-broker
+      # integration tests -- including the full ECU -> CAN -> gateway ->
+      # MQTT scenario test and the Phase 9 resilience-demo tests -- can
+      # never be silently skipped in CI. The only
+      # expected skip is the optional AWS IoT Core smoke test (no AWS
+      # credentials exist here, by design); -rs prints that skip's reason
+      # in the log. No ANTHROPIC_API_KEY exists here either, and the
+      # repo-root conftest.py strips it for every test regardless.
       - name: Run tests
-        run: pytest -v
+        env:
+          MQTT_BROKER_REQUIRED: "1"
+        run: pytest -v -rs

@@ -37,7 +37,12 @@ phase reviewed before the next begins. See [ARCHITECTURE.md](ARCHITECTURE.md)
 for the full architecture, the phase plan, and the reasoning behind every
 major technical decision.
 
-**Current status: Phase 6 complete** — a Diagnostic Anomaly Analyzer now
+**Current status: Phases 0–9 complete** (Phase 8 was done before
+Phase 7); Phase 10 (Engineering Dashboard) and Phase 11 (final docs/
+polish) are not started. The paragraphs below describe the most recent
+phases in the order they were completed.
+
+**Phase 6 (diagnostic analyzer) complete** — a Diagnostic Anomaly Analyzer now
 sits on top of Phase 2's UDS diagnostics: deterministic rules detect
 repeated negative UDS responses, repeated DTC queries, and repeated
 overheating-related (P0217) activity from `DiagnosticEvent`s, and an
@@ -56,6 +61,30 @@ diagnostic server, and Phase 3's ingest/validate/normalize/publish
 pipeline, the system now demonstrates a resilient edge-to-cloud pipeline
 with advisory diagnostic analysis end to end. No dashboard code exists
 yet.
+
+**Phase 8 (testing & CI hardening) complete** — a full-scenario
+integration test now drives seeded ECUs → virtual CAN → the gateway's
+`run()` loop → a real Mosquitto broker → a real subscriber, CI can no
+longer silently skip the broker-backed tests, and
+[docs/assumptions-and-limitations.md](docs/assumptions-and-limitations.md)
+records the current testing limits.
+
+**Phase 7 (observability) complete** (done after Phase 8) —
+`edge_gateway/metrics.py` gives the gateway one in-process metrics object
+(processed / rejected / publish failures / buffered / replayed, plus the
+buffer's dropped count), logged as a structured `"gateway stopped"`
+summary tagged with the run's `session_id`. `session_id` is the run-level
+correlation ID and `event_id` the per-event identity, both carried in
+gateway logs and every payload — see
+[docs/edge-gateway-spec.md](docs/edge-gateway-spec.md)'s "Observability"
+section. No external metrics system (Prometheus, OpenTelemetry,
+CloudWatch Metrics) is used.
+
+**Phase 9 (resilience demo) complete** — `python -m scenarios.resilience_demo`
+runs a self-verifying MQTT outage → SQLite buffering → reconnect → FIFO
+replay → recovery scenario against local Mosquitto and prints PASS/FAIL
+with real counts (see "Resilience demo" below). The Engineering Dashboard
+(Phase 10) and final docs/polish (Phase 11) are not started.
 
 On top of that, this repository has also been made reproducible and
 CI/CD-ready: a `Dockerfile` and an extended `docker/docker-compose.yml`
@@ -89,8 +118,13 @@ This list grows as each phase introduces a real dependency:
 ```bash
 pip install -r requirements.txt   # add --break-system-packages on Debian/Ubuntu system Python
 
-# Run the test suite
+# Run the test suite (broker-backed integration tests skip if no broker is running)
 pytest
+
+# Include the real-broker integration tests, incl. the full ECU -> CAN ->
+# gateway -> MQTT scenario test: start only the broker, then run pytest
+docker compose -f docker/docker-compose.yml up -d mosquitto
+pytest -v -rs
 
 # Run the live simulation for 5 seconds, with a fixed seed for reproducible output
 python -m simulation.run_simulation --duration 5 --seed 42
@@ -127,6 +161,38 @@ docker compose -f docker/docker-compose.yml start mosquitto
 # "replayed buffered events", and mosquitto_sub receive that same burst
 # in original order
 ```
+
+### Resilience demo (Phase 9)
+
+A scripted, self-checking version of that outage story — no second
+terminal, no timing guesswork, no AWS or Anthropic configuration:
+
+```bash
+docker compose -f docker/docker-compose.yml up -d mosquitto
+python -m scenarios.resilience_demo
+```
+
+It runs the real ECUs, Edge Gateway, SQLite buffer and MQTT publisher in
+one process (like `run_demo.py`), injects an MQTT connection outage with
+`edge_gateway.fault_injection.simulated_connection_outage()`, and walks
+through six stages: normal telemetry → outage injected → events buffered
+in SQLite (reconnect attempts failing with exponential backoff) → outage
+cleared and the gateway's own backoff-gated reconnect succeeds → the
+buffer is replayed in FIFO order before any new live event → live
+telemetry resumes. Every stage waits on an observed condition with a
+bounded timeout. A real MQTT subscriber checks that every buffered
+`event_id` arrives, in order, with its original identity; the run ends
+with a PASS/FAIL summary (session_id, published/buffered/replayed counts,
+final buffer depth, FIFO and recovery checks, the metrics snapshot) and
+one structured JSON summary line. The exit code is 0 on PASS, 1 on FAIL.
+
+Options: `--mqtt-host`, `--mqtt-port`, `--vehicle-id`, `--buffer-path`
+(default: a temporary file, removed afterwards), `--outage-events`
+(default 80), and `--show-logs` to also stream the gateway's JSON logs.
+Delivery is at-least-once, not exactly-once — the summary reports any
+duplicates rather than hiding them (none are expected in this controlled
+run). See [docs/assumptions-and-limitations.md](docs/assumptions-and-limitations.md)
+for what the simulated outage does and doesn't exercise.
 
 ## Run with Docker
 
@@ -172,13 +238,19 @@ Every push and pull request to `main` runs
 Ubuntu runners: checkout → Python 3.11 → a fast syntax check → install
 `requirements.txt` → install and start a local Mosquitto broker (via
 `apt-get`, since GitHub-hosted runners don't guarantee a working Docker
-daemon) → `pytest -v`. A failing test fails the workflow run, visible
-directly on the commit/PR.
+daemon), wait until it's listening → `pytest -v -rs`. It also validates
+`docker/docker-compose.yml` with `docker compose config` (no image build).
+CI sets `MQTT_BROKER_REQUIRED=1`, so the real-broker integration tests —
+including the full-scenario ECU → CAN → gateway → MQTT test — *fail*
+rather than silently skip if the broker isn't reachable. A failing test
+fails the workflow run, visible directly on the commit/PR.
 
 CI requires **no secrets or paid services**: no AWS credentials, no AWS
 IoT Core resources, and no `ANTHROPIC_API_KEY`. Tests that need those
 (the AWS IoT smoke test, and anything that would make a real Anthropic
-API call) are written to skip safely when they're absent — CI proves the
+API call) are written to skip safely when they're absent, and the
+repo-root `conftest.py` strips `ANTHROPIC_API_KEY` from every test's
+environment so no test can make a real API call — CI proves the
 simulator, UDS diagnostics, Edge Gateway (including against a real local
 Mosquitto broker), buffering/resilience, and the deterministic analyzer
 rules all work; it does not prove connectivity to a real AWS account,

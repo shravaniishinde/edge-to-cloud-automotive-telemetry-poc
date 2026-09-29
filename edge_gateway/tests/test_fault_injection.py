@@ -12,9 +12,10 @@ from edge_gateway.fault_injection import (
     force_publish_failures,
     malformed_frame,
     out_of_range_frame,
+    simulated_connection_outage,
 )
 from edge_gateway.ingestion import ingest_frame
-from edge_gateway.mqtt_publisher import MqttPublisher
+from edge_gateway.mqtt_publisher import INITIAL_RECONNECT_BACKOFF_SECONDS, MqttPublisher
 from edge_gateway.validation import validate_event
 from common.can_signal_map import decode_to_event
 
@@ -62,3 +63,61 @@ def test_out_of_range_frame_is_rejected_by_validation():
     result = validate_event(event)
 
     assert result.is_valid is False
+
+
+# --- Phase 9: simulated connection outage ---
+
+
+def _connected_publisher(monkeypatch):
+    """A publisher that believes it is connected, with paho's network calls
+    replaced by recorders -- no broker needed."""
+    publisher = MqttPublisher(host="localhost", port=1883)
+    publisher._connected = True  # simulate a prior successful connect()
+    calls = {"reconnect": 0, "disconnect": 0, "loop_stop": 0}
+    for name in calls:
+        monkeypatch.setattr(publisher._client, name, lambda *a, _n=name, **k: calls.__setitem__(_n, calls[_n] + 1))
+    return publisher, calls
+
+
+def test_simulated_outage_makes_the_gateway_see_a_disconnect(monkeypatch):
+    publisher, _calls = _connected_publisher(monkeypatch)
+
+    with simulated_connection_outage(publisher):
+        assert publisher.is_connected() is False
+        assert publisher.publish("some/topic", b"payload") is False
+        assert publisher.try_reconnect(now=0.0) is False  # fails through the real backoff path
+        assert publisher.try_reconnect(now=0.5) is False  # still inside the 1s backoff window
+        assert publisher.try_reconnect(now=1.0) is False  # attempted again, still down
+        assert publisher._reconnect_backoff_seconds == INITIAL_RECONNECT_BACKOFF_SECONDS * 4
+
+
+def test_recovery_is_only_observed_by_the_next_backoff_gated_reconnect(monkeypatch):
+    publisher, calls = _connected_publisher(monkeypatch)
+
+    with simulated_connection_outage(publisher):
+        publisher.try_reconnect(now=0.0)  # fails; next attempt allowed at t=1.0
+
+    assert publisher.is_connected() is False  # clearing the fault alone doesn't reconnect
+    assert publisher.try_reconnect(now=0.5) is False  # backoff still applies
+    assert publisher.try_reconnect(now=1.0) is True
+    assert publisher.is_connected() is True
+    assert calls["reconnect"] == 0  # the real socket was never closed, so it isn't re-opened
+
+
+def test_simulated_outage_clears_even_if_the_block_raises(monkeypatch):
+    publisher, _calls = _connected_publisher(monkeypatch)
+
+    with pytest.raises(RuntimeError):
+        with simulated_connection_outage(publisher):
+            raise RuntimeError("boom")
+
+    assert publisher.try_reconnect(now=10.0) is True
+
+
+def test_disconnect_during_a_simulated_outage_still_closes_the_real_client(monkeypatch):
+    publisher, calls = _connected_publisher(monkeypatch)
+    publisher.inject_connection_outage()
+
+    publisher.disconnect()
+
+    assert calls["loop_stop"] == 1 and calls["disconnect"] == 1

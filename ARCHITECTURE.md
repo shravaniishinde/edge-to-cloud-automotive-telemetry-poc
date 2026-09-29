@@ -1,6 +1,7 @@
 # Architecture & Phase Plan
 
-Status: Phase 6 complete. Implementation proceeds phase by phase; each
+Status: Phases 0-9 complete (Phase 8 was done before Phase 7 -- see the
+Phase 7/8 ordering note below); Phases 10-11 not started. Implementation proceeds phase by phase; each
 phase is reviewed before the next begins. This document is the single
 source of truth for *why* the system is shaped the way it is — update it
 whenever a phase changes or adds a decision.
@@ -28,6 +29,16 @@ numbering in section 5 is otherwise unchanged and still applies going
 forward — resolve this naming overlap explicitly (e.g. rename the
 table's Phase 7, or keep both, whichever you prefer) before it causes
 confusion later.
+
+**Phase 7/8 ordering note (Phase 8):** Phase 8 (Testing & CI hardening)
+was carried out before Phase 7 (Observability). Phase 8 needed nothing
+Phase 7 would add: the existing `session_id` is already the correlation
+ID used end to end, and the per-run counters already exist on
+`EdgeGateway`. Phase 7 was then completed afterwards, building on that
+audit (`docs/assumptions-and-limitations.md`, "Phase 7 observability
+status"): `edge_gateway/metrics.py` now exists, and `session_id` was
+confirmed -- not replaced -- as the run-level correlation ID. See
+section 10.
 
 ## 1. Scope & framing
 
@@ -179,6 +190,7 @@ just the target destination.
 edge-to-cloud-automotive-telemetry-poc/
 ├── README.md, .gitignore, requirements.txt, .env.example, ARCHITECTURE.md   [Phase 0 — done]
 ├── pytest.ini                                        [Phase 1 — done]
+├── conftest.py                                       [Phase 8 — strips ANTHROPIC_API_KEY from every test's env — done]
 ├── docs/
 │   ├── assumptions-and-limitations.md   [started Phase 0, appended every phase — done]
 │   ├── can-signal-spec.md               [Phase 1 — done]
@@ -201,10 +213,10 @@ edge-to-cloud-automotive-telemetry-poc/
 ├── edge_gateway/                        [Phase 3 — done]
 │   ├── ingestion.py, validation.py, normalization.py, gateway.py [Phase 3 — done, untouched since]
 │   ├── mqtt_publisher.py                [Phase 3 — done; extended Phase 4 (reconnect/backoff) and Phase 5 (optional TLS)]
-│   ├── tests/                           [Phase 3 — unit + real-broker integration — done, extended Phase 4 and 5]
+│   ├── tests/                           [Phase 3 — unit + real-broker integration — done, extended Phase 4, 5, and 8 (full-scenario integration test)]
 │   ├── buffer.py, fault_injection.py    [Phase 4 — done]
 │   ├── cloud_publisher.py (local-vs-AWS selection, TLS config) [Phase 5 — done]
-│   └── metrics.py                       [Phase 7]
+│   └── metrics.py                       [Phase 7 — GatewayMetrics/MetricsSnapshot — done]
 ├── infra/                               [Phase 5 — done — Terraform: IoT Thing/certificate/policy/rule, CloudWatch log group]
 ├── analyzer/                            [Phase 6 — done]
 │   ├── models.py                        [Phase 6 — AnomalyReport, Severity — done]
@@ -213,13 +225,13 @@ edge-to-cloud-automotive-telemetry-poc/
 │   ├── llm_explainer.py                 [Phase 6 — optional advisory explanation layer — done]
 │   └── tests/                           [Phase 6 — done]
 ├── dashboard/                           [Phase 10: backend/ (REST+WebSocket), frontend/]
-├── scenarios/resilience_demo.py         [Phase 9]
+├── scenarios/resilience_demo.py         [Phase 9 — self-verifying outage/recovery demo, tests in scenarios/tests/ — done]
 ├── run_demo.py                          [Phase 3 — ECUs + gateway together — done]
 ├── docker/
 │   ├── docker-compose.yml               [Phase 3 — local Mosquitto — done; extended in the reproducibility/Docker/CI pass to add the `app` service — done]
 │   └── Dockerfile                       [reproducibility/Docker/CI pass — Python 3.11, runs run_demo.py — done]
 ├── .dockerignore                        [reproducibility/Docker/CI pass — done]
-└── .github/workflows/ci.yml             [Phase 1 — minimal, grows every phase — extended in the reproducibility/Docker/CI pass (syntax-check step) — done]
+└── .github/workflows/ci.yml             [Phase 1 — minimal, grows every phase — extended in the reproducibility/Docker/CI pass (syntax-check step) and Phase 8 (broker required, Compose validation) — done]
 ```
 
 ## 5. Phase plan
@@ -233,9 +245,9 @@ edge-to-cloud-automotive-telemetry-poc/
 | 4 | Buffering, retry, fault injection — **done** | `edge_gateway/buffer.py`, `edge_gateway/fault_injection.py` (a separate `common/operational_schema.py` turned out not to be needed -- the buffer's rows are plain SQLite columns, not a new Pydantic model) |
 | 5 | AWS integration — **done** | `infra/` (Terraform), `edge_gateway/cloud_publisher.py`, `docs/aws-setup.md` (Kinesis deliberately deferred — see decision table above) |
 | 6 | AI-assisted diagnostic analyzer — **done** (moved up from Phase 9; see "Phase reordering" note above) | `analyzer/` (models, deterministic rules, orchestrator, optional LLM explainer), `docs/analyzer-spec.md` |
-| 7 | Observability | `edge_gateway/metrics.py`, correlation IDs finalized end-to-end |
-| 8 | Testing & CI hardening | full pytest suite, one full-scenario integration test, expanded CI, finalized `assumptions-and-limitations.md` |
-| 9 | Resilience demo | `scenarios/resilience_demo.py` |
+| 7 | Observability — **done** (after Phase 8; see note above) | `edge_gateway/metrics.py`, correlation IDs finalized end-to-end (`session_id` = run-level correlation ID, `event_id` = per-event identity) |
+| 8 | Testing & CI hardening — **done** | full pytest suite, one full-scenario integration test (`edge_gateway/tests/test_full_scenario_integration.py`), expanded CI, finalized `assumptions-and-limitations.md` |
+| 9 | Resilience demo — **done** | `scenarios/resilience_demo.py`, `scenarios/tests/`, `simulated_connection_outage()` in `edge_gateway/fault_injection.py` |
 | 10 | Engineering Dashboard | `dashboard/backend/`, `dashboard/frontend/` |
 | 11 | Final docs & polish | architecture diagram, interview talking-points doc |
 
@@ -314,8 +326,11 @@ Mosquitto — see README.md's "Run with Docker" section.
 **GitHub Actions' role.** `.github/workflows/ci.yml` runs on every push
 and pull request to `main`, on GitHub-hosted Ubuntu: checkout → Python
 3.11 → a fast `python -m compileall` syntax check → `pip install -r
-requirements.txt` → install and start Mosquitto via `apt-get` (a real,
-running broker, not a mock — see section 3) → `pytest -v`. It does not
+requirements.txt` → `docker compose config` validation of the Compose
+file (added in Phase 8) → install and start Mosquitto via `apt-get` (a
+real, running broker, not a mock — see section 3) → wait for it to
+listen → `pytest -v -rs` with `MQTT_BROKER_REQUIRED=1` (Phase 8), so
+broker-backed tests fail rather than skip if the broker is missing. It does not
 build the Docker image (kept out of scope deliberately — pytest is the
 thing that needs to run on every change; a slower Docker build adds CI
 time without adding test coverage the pytest run doesn't already provide,
@@ -332,10 +347,11 @@ configuration -> local Mosquitto" behavior `cloud_publisher.py` has had
 since Phase 5.
 
 **What CI actually proves vs. what needs real AWS credentials.** With
-Mosquitto installed, CI runs the full suite against a real local broker:
-159 unit/integration tests covering the simulator, UDS diagnostics, Edge
+Mosquitto installed, CI runs the full suite against a real local broker
+(as of Phase 8: 166 passed, 1 skipped), covering the simulator, UDS diagnostics, Edge
 Gateway ingest/validate/normalize/publish, buffering/backoff/replay
-resilience, fault injection, and the deterministic analyzer rules, plus
+resilience, fault injection, the Phase 8 full-scenario ECU → CAN →
+gateway → MQTT test, and the deterministic analyzer rules, plus
 `analyzer/tests/test_llm_explainer.py`'s tests (all of which inject a
 fake Anthropic client — none make a real API call). Exactly one test
 (`edge_gateway/tests/test_aws_iot_integration.py`'s AWS smoke test) is
@@ -352,3 +368,94 @@ based and unset by default; `.gitignore` already covered `.env`,
 `*.pem`/`*.crt`/`*.key`, and `infra/certs/` before this pass, and
 `.dockerignore` (new) keeps the same categories out of the Docker build
 context too.
+
+## 10. Observability (Phase 7)
+
+**Correlation model.** No new identifier was introduced -- the two that
+already existed were finalized:
+
+```
+session_id        one per EdgeGateway instance (= one gateway run), minted by the gateway
+ ├── event_id A   one per decoded telemetry frame, minted by the gateway at decode
+ ├── event_id B
+ └── ...
+```
+
+- `session_id` is the run-level correlation ID. It is on every gateway
+  log line (via the logger adapter), inside every published payload (and
+  therefore in CloudWatch via the IoT Rule's `SELECT *`), and on the
+  run's metrics summary. The simulator's own session ID never reaches
+  the wire.
+- `event_id` is the per-event identity. It is on the ingest, reject,
+  publish, and buffer log lines, inside the payload, stored with each
+  buffered row, and (Phase 7) listed on the "replayed buffered events"
+  line. It is never a metrics dimension.
+- A replayed backlog from an earlier run keeps its *original*
+  `session_id`/`event_id` in the payload (a replay never rewrites an
+  event); the replaying run logs those `event_id`s under its own
+  `session_id`, which is the link between the two runs.
+
+**Metrics.** `edge_gateway/metrics.py` holds `GatewayMetrics` -- five
+lock-protected, in-process counters owned by one `EdgeGateway`
+(`processed`, `rejected`, `publish_failures`, `buffered`, `replayed`) --
+and `MetricsSnapshot`, a frozen, JSON-serializable point-in-time copy
+that also carries `session_id` and `dropped`. `dropped` is read from
+`TelemetryBuffer.dropped_count`, which stays the one authoritative drop
+counter (no double counting). Counter meanings are exactly those of the
+Phase 3/4 attributes, which remain available as read-only properties
+(`processed_count`, ...).
+
+**Where it shows up.** `EdgeGateway.run()` logs one structured
+`"gateway stopped"` line (component `metrics`) with the snapshot plus
+`buffer_pending` (`null` if the buffer was already closed) when it exits; run_demo.py's `"demo stopped"` summary is
+built from the same snapshot. Callers can also read
+`EdgeGateway.metrics_snapshot()` at any time.
+
+**Deliberately not added:** Prometheus, Grafana, OpenTelemetry,
+CloudWatch Metrics, a metrics endpoint/server, periodic emission, or
+persistence -- consistent with the "OpenTelemetry excluded from v1"
+decision in section 3. Metrics are per run and start at zero with each
+new gateway instance.
+
+## 11. Resilience demo (Phase 9)
+
+`scenarios/resilience_demo.py` (`python -m scenarios.resilience_demo`) is
+a scenario, not new resilience machinery: it wires the existing ECUs,
+`EdgeGateway`, `TelemetryBuffer`, and `MqttPublisher` exactly like
+`run_demo.py` (one process -- the virtual CAN bus is process-local), then
+drives and verifies an outage against local Mosquitto:
+
+```
+normal publish -> outage injected -> publish fails -> event buffered in SQLite
+  -> more telemetry keeps arriving and is buffered (reconnect attempts fail, backoff grows)
+  -> outage cleared -> next backoff-gated try_reconnect() succeeds
+  -> run_once() replays the whole buffer, FIFO, BEFORE reading the next CAN frame
+  -> new live telemetry publishes normally -> buffer empty -> metrics summary
+```
+
+**Why a new fault-injection scenario was needed.** Phase 4's
+`force_publish_failures()` makes `publish()` fail but leaves
+`is_connected()` true, so the gateway never sees an outage and never runs
+its reconnect -> replay path (buffered events would only replay at the
+next restart, and live events would be published ahead of them). The
+demo therefore uses `simulated_connection_outage()`, a fifth named
+scenario in `edge_gateway/fault_injection.py`, backed by an
+`inject_connection_outage()`/`clear_connection_outage()` hook pair on
+`MqttPublisher` in the same style as `inject_publish_failures()`. While
+active, the publisher reports disconnected, so `publish()` fails through
+its existing not-connected path and `try_reconnect()` fails through its
+existing backoff path; once cleared, recovery is observed only by the
+gateway's next backoff-gated reconnect attempt. With the hook inactive
+(the default), `MqttPublisher` behaves exactly as before.
+
+**Verification** uses only read-only observation: the gateway's existing
+structured log records (published / buffered / replayed `event_id`s, in
+the order the gateway acted) and a real MQTT subscriber. FIFO is checked
+twice -- the replayed `event_id` sequence (SQLite `ORDER BY id`) equals
+the buffered sequence and no live publish appears between the first
+buffered event and the end of replay; and per topic, the subscriber
+received the replayed events in buffered order with non-decreasing
+original timestamps. Replayed payloads must keep their original
+`event_id` and the `session_id` of the run that buffered them. The final
+`MetricsSnapshot` must agree with the observed counts. Delivery remains
+at-least-once; duplicates are reported, not suppressed.

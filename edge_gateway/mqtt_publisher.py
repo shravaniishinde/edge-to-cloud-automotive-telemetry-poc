@@ -101,6 +101,12 @@ class MqttPublisher:
         # behavior; never touched outside tests/demos.
         self._forced_failures_remaining = 0
 
+        # Phase 9 fault injection hook: a simulated *connection* outage
+        # (see inject_connection_outage()). Both False by default, which
+        # leaves every method below behaving exactly as before.
+        self._simulated_outage = False
+        self._simulated_link_intact = False  # real socket untouched by the simulated drop
+
     def connect(self, keepalive: int = 30) -> None:
         self._client.connect(self._host, self._port, keepalive=keepalive)
         self._client.loop_start()  # background thread drives the network loop
@@ -123,6 +129,7 @@ class MqttPublisher:
         this closes exactly that gap."""
         was_connected = self._connected
         self._connected = False
+        self._simulated_link_intact = False  # a real drop overrides any simulated one
         if was_connected and self._logger is not None:
             self._logger.warning(
                 "MQTT disconnected", extra={"reason_code": str(reason_code)},
@@ -154,7 +161,18 @@ class MqttPublisher:
             return False
 
         try:
-            self._client.reconnect()
+            if self._simulated_outage:
+                # Phase 9 fault injection: fail this attempt exactly like
+                # an unreachable broker would, through the same backoff
+                # path below.
+                raise OSError("simulated connection outage (fault injection)")
+            if self._simulated_link_intact:
+                # The simulated outage never closed the real socket, so
+                # there is nothing to re-open -- recovery is observed here,
+                # by the same backoff-gated attempt a real outage uses.
+                self._simulated_link_intact = False
+            else:
+                self._client.reconnect()
             self._connected = True
             self._reconnect_backoff_seconds = INITIAL_RECONNECT_BACKOFF_SECONDS
             self._next_reconnect_attempt_at = 0.0
@@ -203,10 +221,15 @@ class MqttPublisher:
             return False
 
     def disconnect(self) -> None:
-        if self._connected:
+        # _simulated_link_intact: a simulated outage leaves the real
+        # connection (and paho's network thread) open, so it must still be
+        # closed here even though _connected is False.
+        if self._connected or self._simulated_link_intact:
             self._client.loop_stop()
             self._client.disconnect()
             self._connected = False
+            self._simulated_link_intact = False
+        self._simulated_outage = False
 
     def inject_publish_failures(self, count: int) -> None:
         """Test/demo-only hook: makes the next `count` publish() calls
@@ -218,3 +241,32 @@ class MqttPublisher:
 
     def clear_injected_failures(self) -> None:
         self._forced_failures_remaining = 0
+
+    def inject_connection_outage(self) -> None:
+        """Test/demo-only hook (Phase 9): simulates the broker becoming
+        unreachable, as seen from the gateway. Unlike
+        inject_publish_failures() -- which leaves is_connected() True, so
+        the gateway never notices an outage and never triggers its
+        reconnect/replay path -- this makes the publisher report
+        disconnected: publish() fails through its normal not-connected
+        path, and every try_reconnect() attempt fails through its normal
+        exponential-backoff path until clear_connection_outage(). The real
+        socket is not touched (no network or Docker changes needed), so
+        once cleared, the next backoff-gated try_reconnect() succeeds and
+        EdgeGateway's existing reconnect -> replay logic takes over. See
+        edge_gateway/fault_injection.py's simulated_connection_outage()."""
+        self._simulated_outage = True
+        if self._connected:
+            self._connected = False
+            self._simulated_link_intact = True
+        if self._logger is not None:
+            self._logger.warning("MQTT connection outage injected (fault injection)")
+
+    def clear_connection_outage(self) -> None:
+        """Ends a simulated outage. Deliberately does NOT mark the
+        publisher connected: recovery is only observed by the next
+        try_reconnect() attempt, exactly as with a real broker coming
+        back, so the gateway's own reconnect -> replay path runs."""
+        self._simulated_outage = False
+        if self._logger is not None:
+            self._logger.info("MQTT connection outage cleared (fault injection)")

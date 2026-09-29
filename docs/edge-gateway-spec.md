@@ -124,7 +124,9 @@ Explicitly out of scope for Phase 3, on purpose:
 - **No metrics export.** `EdgeGateway` tracks `processed_count`,
   `rejected_count`, and `publish_failure_count` as plain instance
   attributes for this run's own summary log line -- there's no persisted
-  or externally-queryable metrics system yet. That's Phase 6.
+  or externally-queryable metrics system yet. (Written as "Phase 6"
+  originally; after the Phase 6 reordering it became Phase 7 -- see
+  "Observability (Phase 7)" below.)
 - **No AWS IoT Core / TLS.** The broker is local, unauthenticated
   Mosquitto (`allow_anonymous true` in `docker/mosquitto/mosquitto.conf`)
   -- fine for a developer's own machine, explicitly not something to
@@ -145,11 +147,30 @@ against an actual Mosquitto instance -- publishing a valid frame,
 confirming an out-of-range frame is silently dropped, and confirming a
 UDS frame sharing the bus is ignored.
 
+Phase 8 added `test_full_scenario_integration.py`: the whole pipeline
+wired exactly like `run_demo.py` -- 3 seeded ECUs on their own threads,
+`EdgeGateway.run()` on its own thread, a real broker, a real subscriber
+-- asserting every signal arrives on its normalized topic, the payload
+round-trips through `TelemetryEvent`, each ECU's seeded first-tick value
+is exact, every received `event_id` appears in the gateway's ingest and
+publish log lines under the gateway's `session_id`, nothing is rejected,
+buffered, lost or duplicated, and every thread stops on `stop_event`.
+`test_gateway_integration.py` also gained a restart test (a backlog left
+in the SQLite file by a "previous run" is replayed in FIFO order as soon
+as `run()` starts, keeping its original `session_id`/`event_id`).
+
+Broker-backed tests use conftest.py's `mqtt_subscriber` factory (waits
+for a real SUBACK rather than sleeping, closed automatically at
+teardown) and publish under a per-run random `vehicle_id`, so other
+traffic on the same broker -- e.g. the Compose `app` container running
+`run_demo.py` as `SIM-VEHICLE-01` -- can't leak into their assertions.
+
 `edge_gateway/tests/conftest.py`'s `mosquitto_broker` fixture connects to
 an already-running broker at `localhost:1883` by default (overridable via
 the `MQTT_BROKER_HOST` / `MQTT_BROKER_PORT` environment variables) rather
 than spawning one itself, and skips the tests that need it if nothing is
-listening there. `docker/docker-compose.yml` is the normal way to provide
+listening there -- unless `MQTT_BROKER_REQUIRED=1` is set (CI sets it),
+in which case an unreachable broker fails those tests instead. `docker/docker-compose.yml` is the normal way to provide
 that broker -- for local development, manual demo use
 (`docker compose up`, then `python run_demo.py`), and CI alike, so there
 is exactly one broker-provisioning story, not two competing ones. CI's
@@ -157,6 +178,40 @@ own `mosquitto` package install (`.github/workflows/ci.yml`) starts an
 equivalent broker via its systemd service instead of Docker, since
 GitHub-hosted runners don't guarantee a working Docker daemon -- same
 broker, same config concept, different launch mechanism.
+
+## Observability (Phase 7)
+
+**Correlation.** `session_id` is minted once per `EdgeGateway` instance
+(one gateway run) and is the run-level correlation ID; `event_id` is
+minted once per decoded frame and is the per-event identity. Both are in
+every published payload. `session_id` is on every gateway log line;
+`event_id` is on the ingest, reject, publish, and buffer lines and --
+since Phase 7 -- on the "replayed buffered events" line as `event_ids`.
+Filter logs by `session_id` to reconstruct a run, by `event_id` to follow
+one reading.
+
+**Metrics.** `edge_gateway/metrics.py`:
+
+| Field | Incremented when | Source |
+|---|---|---|
+| `processed` | a live publish is broker-acknowledged | `GatewayMetrics` |
+| `rejected` | validation drops an out-of-range event | `GatewayMetrics` |
+| `publish_failures` | a live publish is not acknowledged | `GatewayMetrics` |
+| `buffered` | that failed event is written to the SQLite buffer | `GatewayMetrics` |
+| `replayed` | a buffered event is published and acknowledged | `GatewayMetrics` |
+| `dropped` | the full buffer drops its oldest row | read from `TelemetryBuffer.dropped_count` |
+
+`EdgeGateway.metrics_snapshot()` returns a frozen `MetricsSnapshot`
+(those six plus `session_id`); `as_log_fields()` gives the flat dict used
+as structured-log `extra=`. `EdgeGateway.run()` logs it as
+`"gateway stopped"` (component `metrics`, plus `buffer_pending` -- `null`
+if the caller already closed the buffer; the summary never masks an
+exception from the loop itself) on exit,
+and run_demo.py's `"demo stopped"` summary uses the same snapshot. The
+Phase 3/4 attributes (`processed_count`, `rejected_count`,
+`publish_failure_count`, `buffered_count`, `replayed_count`) remain as
+read-only properties backed by the metrics object. In-process only -- no
+exporter, server, or persistence.
 
 ## Resilience (Phase 4)
 
@@ -235,7 +290,7 @@ a genuine publish failure) rather than skipping ahead, so nothing later
 in the buffer can ever be sent out of order ahead of something earlier
 that's still unconfirmed.
 
-### Fault injection: four named scenarios, not a chaos framework
+### Fault injection: named scenarios, not a chaos framework
 
 `edge_gateway/fault_injection.py` provides `force_publish_failures()` (a
 context manager that makes `publish()` report failure for a fixed count,
@@ -245,6 +300,19 @@ without touching the network -- used by the deterministic tests) plus
 uses an actual `docker compose stop mosquitto` for the outage scenario
 (see README.md) -- Docker Compose is already this project's one broker
 mechanism, so there's no need to fake that particular failure mode.
+
+Phase 9 added a fifth scenario, `simulated_connection_outage()`, for the
+scripted resilience demo (`scenarios/resilience_demo.py`).
+`force_publish_failures()` leaves the publisher reporting "connected", so
+it can't exercise the reconnect -> replay path; the new scenario uses an
+`inject_connection_outage()`/`clear_connection_outage()` hook pair on
+`MqttPublisher` so the gateway sees a disconnect: `publish()` fails
+through its existing not-connected path, `try_reconnect()` fails through
+its existing backoff path, and after the context exits the next
+backoff-gated attempt succeeds and the gateway replays its buffer. The
+real socket is never closed (so no real reconnect is needed); with the
+hook inactive, publisher behaviour is unchanged. See ARCHITECTURE.md
+section 11.
 
 ### Testing strategy, extended
 

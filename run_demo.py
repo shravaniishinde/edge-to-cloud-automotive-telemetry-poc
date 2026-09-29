@@ -130,14 +130,13 @@ def main(
             bus.shutdown()
         gateway_bus.shutdown()
         publisher.disconnect()
+        # Phase 7: one MetricsSnapshot (edge_gateway/metrics.py) instead of
+        # reading six counters by hand. It carries the gateway's session_id,
+        # so this summary correlates with every gateway log line and
+        # published payload from the same run.
         logging.getLogger("run_demo").info(
             "demo stopped", extra={
-                "processed": gateway.processed_count,
-                "rejected": gateway.rejected_count,
-                "publish_failures": gateway.publish_failure_count,
-                "buffered": gateway.buffered_count,
-                "replayed": gateway.replayed_count,
-                "buffer_dropped": buffer.dropped_count,
+                **gateway.metrics_snapshot().as_log_fields(),
                 "still_buffered": buffer.count(),  # must be read before buffer.close() below
             },
         )

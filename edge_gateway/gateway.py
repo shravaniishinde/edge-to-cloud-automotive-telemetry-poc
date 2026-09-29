@@ -18,10 +18,18 @@ in order, once the connection recovers. See `_replay_buffered()` below
 and docs/edge-gateway-spec.md's "Resilience" section for the full design
 and its one accepted limitation (an at-least-once, not exactly-once,
 delivery guarantee).
+
+Phase 7 moves the per-run counters into one `GatewayMetrics` object
+(edge_gateway/metrics.py) owned by this instance -- same increment points,
+same meanings -- and has `run()` log a structured "gateway stopped"
+summary (a `MetricsSnapshot`, tagged with this run's session_id) when it
+exits. The old `processed_count`/... attributes remain as read-only
+properties backed by that object.
 """
 
 from __future__ import annotations
 
+import sqlite3
 import threading
 import uuid
 from typing import Optional
@@ -32,6 +40,7 @@ from common.telemetry_schema import DEFAULT_VEHICLE_ID
 from edge_gateway.buffer import TelemetryBuffer
 from edge_gateway.ingestion import ingest_frame
 from edge_gateway.logging_config import get_gateway_logger
+from edge_gateway.metrics import GatewayMetrics, MetricsSnapshot
 from edge_gateway.mqtt_publisher import MqttPublisher
 from edge_gateway.normalization import normalize
 from edge_gateway.validation import validate_event
@@ -63,15 +72,13 @@ class EdgeGateway:
         self._log_validate = get_gateway_logger(self.session_id, "validation")
         self._log_publish = get_gateway_logger(self.session_id, "publish")
         self._log_buffer = get_gateway_logger(self.session_id, "buffer")
+        self._log_metrics = get_gateway_logger(self.session_id, "metrics")
 
-        # Counters exist for this run's own summary log line. Persisted/
-        # exported metrics are Phase 6 -- see ARCHITECTURE.md's phase table.
-        self.processed_count = 0
-        self.rejected_count = 0
-        self.publish_failure_count = 0
-        self.buffered_count = 0
-        self.replayed_count = 0
-                # Replay is requested after MQTT recovery, or when the gateway
+        # Phase 7: one metrics object for this gateway instance's lifetime
+        # (i.e. one run), tagged with the same session_id as every log line.
+        self.metrics = GatewayMetrics(session_id=self.session_id)
+
+        # Replay is requested after MQTT recovery, or when the gateway
         # starts with a persisted backlog. A live publish failure alone
         # does not trigger immediate replay.
         self._replay_requested = False
@@ -104,7 +111,7 @@ class EdgeGateway:
 
         result = validate_event(event)
         if not result.is_valid:
-            self.rejected_count += 1
+            self.metrics.record_rejected()
             self._log_validate.warning(
                 "rejected telemetry event", extra={
                     "event_id": event.event_id, "can_id": event.can_id, "reason": result.reason,
@@ -115,16 +122,16 @@ class EdgeGateway:
         topic, payload = normalize(event)
         published = self._publisher.publish(topic, payload)
         if published:
-            self.processed_count += 1
+            self.metrics.record_processed()
             self._log_publish.info(
                 "published telemetry event", extra={
                     "event_id": event.event_id, "topic": topic,
                 },
             )
         else:
-            self.publish_failure_count += 1
+            self.metrics.record_publish_failure()
             self._buffer.enqueue(event.event_id, topic, payload)
-            self.buffered_count += 1
+            self.metrics.record_buffered()
             self._log_buffer.warning(
                 "publish failed -- buffered for replay", extra={
                     "event_id": event.event_id, "topic": topic, "buffer_size": self._buffer.count(),
@@ -149,12 +156,14 @@ class EdgeGateway:
                 return True
 
             confirmed_ids = []
+            confirmed_event_ids = []  # Phase 7: per-event traceability for replays
             for row in batch:
                 if not self._publisher.is_connected():
                     break
                 if self._publisher.publish(row.topic, row.payload):
                     confirmed_ids.append(row.id)
-                    self.replayed_count += 1
+                    confirmed_event_ids.append(row.event_id)
+                    self.metrics.record_replayed()
                 else:
                     break
 
@@ -163,6 +172,7 @@ class EdgeGateway:
                 self._log_buffer.info(
                     "replayed buffered events", extra={
                         "replayed": len(confirmed_ids), "buffer_size": self._buffer.count(),
+                        "event_ids": confirmed_event_ids,
                     },
                 )
 
@@ -170,9 +180,55 @@ class EdgeGateway:
                 return False # didn't clear the whole batch -- stop for now, try again next run_once()
 
     def run(self, stop_event: threading.Event) -> None:
-        """Runs run_once() in a loop until stop_event is set."""
+        """Runs run_once() in a loop until stop_event is set, then logs one
+        structured "gateway stopped" line with this run's metrics snapshot
+        (the log line already carries session_id via the logger adapter)."""
         if self._buffer.count() > 0:
             self._replay_requested = True
 
-        while not stop_event.is_set():
-            self.run_once()
+        try:
+            while not stop_event.is_set():
+                self.run_once()
+        finally:
+            # The summary must never mask an exception from the loop itself,
+            # nor fail if a caller already closed the buffer after a join()
+            # timeout (run_demo.py joins with a timeout shorter than one
+            # worst-case iteration) -- report the pending depth as unknown.
+            try:
+                buffer_pending = self._buffer.count()
+            except sqlite3.Error:
+                buffer_pending = None
+            self._log_metrics.info(
+                "gateway stopped", extra={
+                    **self.metrics_snapshot().as_log_fields(),
+                    "buffer_pending": buffer_pending,
+                },
+            )
+
+    def metrics_snapshot(self) -> MetricsSnapshot:
+        """This run's counters plus the buffer's own (authoritative)
+        dropped-event count, as one immutable, log-ready snapshot."""
+        return self.metrics.snapshot(dropped=self._buffer.dropped_count)
+
+    # --- Backward-compatible, read-only views of self.metrics (Phases 3-4
+    # exposed these as plain attributes; tests and run_demo.py read them). ---
+
+    @property
+    def processed_count(self) -> int:
+        return self.metrics.processed
+
+    @property
+    def rejected_count(self) -> int:
+        return self.metrics.rejected
+
+    @property
+    def publish_failure_count(self) -> int:
+        return self.metrics.publish_failures
+
+    @property
+    def buffered_count(self) -> int:
+        return self.metrics.buffered
+
+    @property
+    def replayed_count(self) -> int:
+        return self.metrics.replayed

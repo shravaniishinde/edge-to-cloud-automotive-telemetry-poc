@@ -13,7 +13,8 @@ introduces a simplification worth being explicit about.
 - AWS resources (introduced from Phase 5 onward) are expected to be
   created for a demo/test session and torn down afterward, not left
   running indefinitely.
-- Any AI/LLM-based analysis (introduced in Phase 9) is advisory only. It
+- Any AI/LLM-based analysis (originally planned for Phase 9; actually
+  delivered in Phase 6 -- see `ARCHITECTURE.md`) is advisory only. It
   is never the sole basis for a safety- or correctness-relevant decision;
   deterministic rules are always the authority for objective anomaly
   detection.
@@ -112,7 +113,9 @@ introduces a simplification worth being explicit about.
 - No metrics are persisted or exported yet -- `EdgeGateway` only tracks
   per-run counters (`processed_count`, `rejected_count`,
   `publish_failure_count`) as plain attributes for a summary log line.
-  Phase 6 adds a real metrics system.
+  A real metrics system was planned for "Phase 6" when this was written;
+  after the Phase 6 reordering it became Phase 7 (`edge_gateway/metrics.py`),
+  now implemented -- see the Phase 7 section below.
 - Phase 2's UDS diagnostic events are not ingested, validated, or
   published by the gateway. UDS remains a standalone client/server demo.
 - The automated test suite's real-broker integration tests connect to an
@@ -170,7 +173,8 @@ introduces a simplification worth being explicit about.
 - No metrics are persisted or exported yet -- `buffered_count`,
   `replayed_count`, and `TelemetryBuffer.dropped_count` are still plain
   in-memory counters for this run's own summary log line, same as
-  Phase 3's counters. A real metrics system is still Phase 6.
+  Phase 3's counters. (Superseded: Phase 7 moved all of these into
+  `edge_gateway/metrics.py` -- see the Phase 7 section below.)
 
 ## Assumptions and limitations added in Phase 5
 
@@ -299,3 +303,189 @@ Further entries are added as each phase is implemented.
   internet access, so this is a scope decision (kept out to keep CI fast
   and focused on tests), not a limitation carried over from the sandbox
   restriction above.
+
+## Phase 7 observability status (audited at the start of Phase 8)
+
+*Historical: this audit was written before Phase 7 was implemented. Its
+"Not implemented" and "Known correlation gaps" items were addressed by
+Phase 7 -- see "Assumptions and limitations added in Phase 7" below.*
+
+Phase 8 (testing & CI hardening) was carried out before the original
+Phase 7 (observability). An audit of what Phase 7 would build on found:
+
+- **Already in place:** structured JSON-lines logging
+  (`edge_gateway/logging_config.py`) where every gateway log record
+  carries the gateway-owned `session_id` and a `component` label; a
+  per-event `event_id` (a UUID minted when the gateway decodes a frame)
+  on the ingest, reject, publish, and buffer log lines; and both IDs
+  inside every published MQTT payload (it is the `TelemetryEvent` JSON
+  itself), so they also reach CloudWatch via the IoT Rule's
+  `SELECT *`. Per-run counters exist on `EdgeGateway`
+  (`processed_count`, `rejected_count`, `publish_failure_count`,
+  `buffered_count`, `replayed_count`) and `TelemetryBuffer`
+  (`dropped_count`).
+- **Correlation:** `session_id` *is* this project's correlation ID --
+  `ARCHITECTURE.md` uses "session/correlation ID" interchangeably, and
+  one gateway run's ingest -> validate -> publish/buffer story can be
+  reconstructed by filtering logs on it (Phase 8's full-scenario test
+  now asserts exactly that). No separate `correlation_id` field was
+  added: nothing in the implemented contract needs one, and adding it
+  would only duplicate `session_id`.
+- **Not implemented (still Phase 7 scope, deliberately left untouched):**
+  `edge_gateway/metrics.py` does not exist. The counters above are plain
+  in-memory attributes, exposed only through `run_demo.py`'s final
+  "demo stopped" summary log line -- nothing periodically emits, exports,
+  or persists them, and they reset every run.
+- **Known correlation gaps, left for Phase 7:** the "replayed buffered
+  events" log line records only counts, not the `event_id`s replayed
+  (the replayed payloads themselves still carry their `event_id`). A
+  backlog replayed after a restart is logged under the *new* run's
+  `session_id`, while the replayed payloads keep the *original* run's
+  `session_id` -- intentional (a replay never rewrites an event), and now
+  covered by a test, but it means one session's logs alone don't list
+  events it replayed on behalf of an earlier session. The simulator's own
+  `session_id` never reaches the CAN wire (unchanged since Phase 3), so
+  correlation starts at the gateway, not at the ECU.
+
+## Assumptions and limitations added in Phase 8 (testing & CI hardening)
+
+- **Full-scenario integration test**
+  (`edge_gateway/tests/test_full_scenario_integration.py`): 3 seeded
+  ECUs on their own `run_ecu` threads -> virtual CAN bus ->
+  `EdgeGateway.run()` on its own thread -> real Mosquitto -> a real MQTT
+  subscriber, wired exactly like `run_demo.py` and all in one process
+  (the virtual-bus constraint). Only each ECU's *first* tick is
+  value-checked: seeding makes it exactly predictable, but how many
+  later ticks happen before shutdown depends on thread scheduling, so
+  later messages are checked for schema/identity/range consistency, not
+  specific values. It publishes to the local broker only -- it says
+  nothing about AWS IoT Core, which remains covered by the optional,
+  credential-gated smoke test alone.
+- **Broker-backed tests skip locally, fail in CI.** Without a reachable
+  broker, the broker-backed tests (the full-scenario test plus
+  `test_gateway_integration.py`) skip, so `pytest` stays usable on a
+  machine with no Docker/Mosquitto. CI sets `MQTT_BROKER_REQUIRED=1`,
+  which turns that skip into a failure, so a broken Mosquitto install
+  can never make CI green by silently skipping the integration tests.
+  The only expected skip in CI is the AWS IoT Core smoke test.
+- **Local vs. CI broker.** Locally the broker comes from Docker Compose
+  (`docker compose -f docker/docker-compose.yml up -d mosquitto`); CI
+  uses Ubuntu's apt-installed `mosquitto` service (no Docker-in-Docker).
+  Both are plain, anonymous Mosquitto on port 1883; the CI one uses the
+  distro's default config rather than `docker/mosquitto/mosquitto.conf`.
+- **Test isolation from other broker traffic.** Broker-backed tests
+  publish under a per-run random `vehicle_id` and subscribe only to that
+  vehicle's topics. Before Phase 8 they used `SIM-VEHICLE-01` and
+  subscribed to every vehicle, so running them while the Compose `app`
+  container (`run_demo.py`) was also publishing to the same broker made
+  4 of 6 fail -- reproduced, then fixed. Tests still assume nothing else
+  publishes to *their* random vehicle ID.
+- **Timing.** Test subscribers now wait for the broker's SUBACK instead
+  of a fixed sleep, and positive assertions poll with a timeout. Tests
+  that assert "nothing was published" still, unavoidably, listen for a
+  fixed 0.3 s window -- an absence can only be observed for a bounded
+  time.
+- **No real Anthropic calls, enforced.** A repo-root `conftest.py`
+  removes `ANTHROPIC_API_KEY` (and `ANTHROPIC_BASE_URL`/`ANTHROPIC_MODEL`)
+  from the environment for every test, so a key in a developer's shell
+  can't turn a test into a real, billed API call. `AWS_IOT_*` variables
+  are deliberately not stripped, so the optional AWS smoke test still
+  runs for a developer who has provisioned AWS and exported them.
+- **Not added, on purpose:** no coverage gate, linter, type checker, or
+  per-test timeout plugin (no new dependencies). CI instead has a
+  15-minute job timeout so a hung thread fails fast, and validates the
+  Compose file with `docker compose config` (no image build or pull).
+  The Docker image itself is still not built in CI, as before.
+- **Docker verified outside the sandbox.** The reproducibility pass's
+  note above (a full `docker build` couldn't run in its sandbox) is now
+  resolved on a developer machine: during Phase 8,
+  `docker compose -f docker/docker-compose.yml up -d --build app` built
+  the image and the `app` container published telemetry to the Compose
+  Mosquitto broker. No Docker files were changed.
+
+## Assumptions and limitations added in Phase 7 (observability)
+
+Phase 7 was implemented after Phase 8, on top of the audit above.
+
+- **Correlation: finalized, not replaced.** `session_id` (one per
+  `EdgeGateway` instance, i.e. per gateway run) is the run-level
+  correlation ID; `event_id` (one per decoded frame) is the per-event
+  identity. No separate `correlation_id` was introduced -- it would only
+  duplicate `session_id`. The audit's replay gap was closed: the
+  "replayed buffered events" log line now lists the replayed `event_id`s,
+  so events replayed on behalf of an earlier run are traceable from the
+  replaying run's logs. Correlation still starts at the gateway: the
+  simulator's own session ID never reaches the CAN wire.
+- **Metrics are an in-process abstraction, not a monitoring system.**
+  `edge_gateway/metrics.py`'s `GatewayMetrics` holds `processed`,
+  `rejected`, `publish_failures`, `buffered`, and `replayed` for one
+  gateway instance; `MetricsSnapshot` adds `session_id` and `dropped`.
+  They are exposed via `EdgeGateway.metrics_snapshot()`, a "gateway
+  stopped" log line when `run()` exits, and run_demo.py's "demo stopped"
+  summary. Nothing emits them periodically, exports them (no Prometheus,
+  OpenTelemetry, Grafana, or CloudWatch Metrics), or persists them; they
+  start at zero for every new gateway instance and there is no reset
+  method. If the process dies without `run()` exiting, no summary line is
+  written -- the per-event log lines remain.
+- **`dropped` has one authority.** It is read from
+  `TelemetryBuffer.dropped_count` at snapshot time rather than counted
+  twice. That count belongs to the buffer *instance*, so it equals "this
+  run's drops" only when, as in run_demo.py, each gateway run opens its
+  own `TelemetryBuffer`. Drop counts are not persisted, so drops from a
+  previous process are not included.
+- **`buffered` equals `publish_failures` today.** Every failed live
+  publish is buffered; both are kept because they are different facts.
+  A replay attempt that stops early is not counted as a publish failure
+  (unchanged from Phase 4) -- the rows simply stay buffered.
+- **Thread safety.** Counters are only incremented on the gateway's own
+  thread today; a lock still guards each increment and snapshot, so a
+  snapshot read from another thread (run_demo.py's main thread, tests)
+  is always internally consistent.
+- **Log field change.** run_demo.py's "demo stopped" line now uses the
+  snapshot's field names: `buffer_dropped` became `dropped`, and the line
+  gained `session_id`. Its "starting demo" line is unchanged and still
+  names the same value `gateway_session_id`.
+
+## Assumptions and limitations added in Phase 9 (resilience demo)
+
+- **The outage is simulated at the publisher boundary, not the network.**
+  `simulated_connection_outage()` makes the gateway see a disconnect
+  (`is_connected()` false, publishes fail, reconnect attempts fail with
+  real exponential backoff), but the MQTT socket itself stays open. So
+  the demo proves the *gateway's* outage handling -- detection,
+  buffering, backoff, reconnect-triggered FIFO replay, metrics -- not
+  paho-mqtt's or Mosquitto's own behaviour when a TCP connection really
+  drops. The manual `docker compose stop/start mosquitto` walkthrough in
+  README.md remains the way to see a genuine broker outage.
+- **`force_publish_failures()` does not trigger replay** (found while
+  building this phase, not changed): it leaves the publisher "connected",
+  and the gateway only requests a replay after it observes a reconnect or
+  at startup with a backlog. Publish failures that happen *without* a
+  detected disconnect (e.g. a PUBACK timeout on a still-open connection)
+  therefore stay buffered until the next reconnect or restart, and live
+  events published meanwhile go out ahead of them. This is existing
+  Phase 4 behaviour ("a live publish failure alone does not trigger
+  immediate replay"), documented here rather than redesigned.
+- **Recovery is backoff-gated.** After the outage is cleared, the gateway
+  notices only on its next reconnect attempt (1 s, doubling, capped at
+  30 s), and it keeps buffering until then -- which is why the demo
+  usually buffers more events than `--outage-events`. The recovery
+  timeout (45 s) is deliberately longer than the 30 s backoff cap.
+- **Delivery is at-least-once.** The controlled demo normally receives no
+  duplicates, but a crash between a broker acknowledgement and the buffer
+  row's deletion could replay an event twice; the demo reports a
+  `duplicates_received` count rather than asserting exactly-once.
+- **FIFO across topics is checked on the gateway side.** MQTT only
+  guarantees ordering per topic, so the subscriber-side FIFO check is per
+  topic; global order is verified from the gateway's own log sequence
+  (the replayed `event_id` order equals the buffered order, and no live
+  publish happens between the outage and the end of replay).
+- **Local Mosquitto only.** The demo builds `MqttPublisher` directly
+  (ignoring `AWS_IOT_*`), needs no AWS/Anthropic configuration, and is
+  not part of the Docker image (`docker/Dockerfile` still copies only
+  what `run_demo.py` needs). It needs a fresh buffer: by default a
+  temporary file that is deleted afterwards; `--buffer-path` must not
+  already exist, so a leftover backlog can't skew the counts.
+- **Test cost.** The broker-backed demo tests run the real threads with
+  smaller event counts and take roughly 5 s each; together they roughly
+  double the broker-backed suite's run time (still well under a minute).

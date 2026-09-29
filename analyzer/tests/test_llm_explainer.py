@@ -139,3 +139,18 @@ def test_explain_anomaly_never_changes_the_report_itself():
     assert report.severity == original_severity
     assert report.title == original_title
     assert report.llm_explanation is None
+
+
+def test_explain_anomaly_default_env_path_makes_no_call_without_a_key():
+    """The default `env=None` path reads os.environ. The repo-root
+    conftest.py strips ANTHROPIC_API_KEY for every test, so even with a
+    real key in the developer's shell this must short-circuit before ever
+    touching a client."""
+
+    # explain_anomaly() swallows client exceptions by design, so a raising
+    # tripwire could pass silently -- record calls instead.
+    tripwire = _FakeClient()
+
+    assert is_llm_configured() is False
+    assert explain_anomaly(_make_report(), [_make_event()], client=tripwire) is None
+    assert tripwire.messages.calls == []
