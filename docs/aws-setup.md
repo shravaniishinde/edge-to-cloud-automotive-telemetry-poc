@@ -82,12 +82,57 @@ AWS_IOT_ENDPOINT=<terraform output -raw aws_iot_endpoint>
 AWS_IOT_CA_PATH=./infra/certs/AmazonRootCA1.pem
 AWS_IOT_CERT_PATH=<terraform output -raw device_certificate_path>
 AWS_IOT_KEY_PATH=<terraform output -raw device_private_key_path>
+AWS_IOT_CLIENT_ID=edge-to-cloud-telemetry-poc-vehicle
 ```
 
-All four must be set together. `edge_gateway/cloud_publisher.py` treats
-any other combination (some set, some not) as a configuration error and
-refuses to start -- it will never silently connect to local Mosquitto
-instead. See that module's docstring for the exact rule.
+The first four must be set together. `edge_gateway/cloud_publisher.py`
+treats any other combination (some set, some not) as a configuration
+error and refuses to start -- it will never silently connect to local
+Mosquitto instead. See that module's docstring for the exact rule.
+
+**`AWS_IOT_CLIENT_ID` is also required in practice.** The IoT policy in
+`infra/iot.tf` only allows `iot:Connect` for the MQTT client ID equal to
+the Thing name (`edge-to-cloud-telemetry-poc-vehicle`). The loader treats
+the client ID as optional, and if it is unset paho-mqtt connects with a
+generated ID, which AWS IoT Core rejects. The symptom is a publish that
+is never acknowledged, not a clear error.
+
+Nothing in the project loads `.env` automatically. Export the variables
+in the shell that runs the command. In PowerShell, from the repository
+root (the certificate paths are relative to it), this loads only the
+`AWS_IOT_*` lines from `.env` without printing them:
+
+```powershell
+Get-Content .env | Where-Object { $_ -match '^\s*AWS_IOT_[A-Z_]+\s*=' } | ForEach-Object { $n, $v = $_ -split '=', 2; Set-Item -Path "Env:$($n.Trim())" -Value $v.Trim() }
+```
+
+Clear them afterwards so later runs use local Mosquitto again:
+
+```powershell
+Get-ChildItem Env:AWS_IOT_* | Remove-Item
+```
+
+## 3a. Smoke-test the connection (optional)
+
+`edge_gateway/tests/test_aws_iot_integration.py` opens a mutual-TLS
+connection with the same `MqttPublisher` the gateway uses and publishes
+one QoS 1 message, `{"smoke_test": true}`, to
+`vehicle/SIM-VEHICLE-01/telemetry/powertrain/vehicle_speed_kph`. It passes
+only if AWS IoT Core acknowledges the publish. It skips when the
+`AWS_IOT_*` variables aren't exported, which is why it always skips in CI.
+
+In AWS Console -> IoT Core -> MQTT test client, subscribe to `vehicle/#`
+first, then, with the variables exported:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest edge_gateway/tests/test_aws_iot_integration.py -v -rs
+```
+
+Expected: `1 passed`, and the test client shows `{"smoke_test": true}` on
+that topic. The topic matches the IoT Rule, so the message also lands in
+the CloudWatch log group. `SKIPPED` means the variables weren't exported
+in that shell; a failed assertion usually means `AWS_IOT_CLIENT_ID` is
+missing or the certificate isn't active and attached in AWS.
 
 ## 4. Run the gateway against AWS
 

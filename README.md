@@ -1,383 +1,335 @@
 # Edge-to-Cloud Automotive Telemetry POC
 
-A production-style, no-hardware Proof of Concept demonstrating an edge-to-cloud
-telemetry pipeline for a simulated small vehicle network.
+[![CI](https://github.com/shravaniishinde/edge-to-cloud-automotive-telemetry-poc/actions/workflows/ci.yml/badge.svg)](https://github.com/shravaniishinde/edge-to-cloud-automotive-telemetry-poc/actions/workflows/ci.yml)
 
-## What this project is
+A no-hardware automotive telemetry proof of concept:
+**virtual ECUs → CAN → Edge Gateway → resilient MQTT → AWS IoT Core → observability and an engineering dashboard.**
 
-- Simulates a small in-vehicle network: multiple logical ECUs (powertrain,
-  battery/energy, body/status) communicating over a **virtual** CAN bus — no
-  physical hardware or real vehicle involved.
-- Performs basic UDS (ISO 14229) diagnostic interactions against the
-  simulated ECUs.
-- Uses an **Edge Gateway** to ingest, validate, normalize, buffer, and
-  reliably forward telemetry to the cloud — including graceful handling of
-  connectivity loss (local buffering + replay on reconnect).
-- Streams telemetry to **AWS IoT Core** over MQTT, with structured JSON
-  logging and operational metrics for observability.
-- Includes a deterministic anomaly-detection rule engine plus an
-  **LLM-based advisory log analyzer** — the LLM only explains/summarizes
-  what the deterministic rules already flagged; it never makes the
-  anomaly call itself.
-- Includes a lightweight engineering web dashboard (Phase 10) that
-  visualizes the real, live state of the running system (no fabricated
-  data).
+Everything runs on a laptop: three simulated ECUs on a virtual CAN bus,
+an edge gateway that keeps working through connectivity loss, a local
+Mosquitto broker for repeatable demos, and a real AWS IoT Core path
+(Terraform-provisioned, mutual TLS) for the cloud side.
 
-## What this project is NOT
+> **What this is not:** not connected to a real vehicle or CAN hardware,
+> not certified automotive software (e.g. ISO 26262), and not a production
+> deployment. It is a portfolio engineering POC that applies real-world
+> edge-to-cloud concerns at small scale.
 
-This is a personal portfolio engineering exercise. It is **not** a
-certified automotive system and is **not** connected to any real vehicle
-or hardware. It should be described as a "production-style" or
-"real-world-inspired" edge-to-cloud POC — never as production automotive
-software.
+## Why this project
 
-## Status
+Vehicles produce continuous telemetry, but the link to the cloud is
+unreliable. An edge-to-cloud pipeline has to decode and validate raw bus
+data, keep collecting when the network drops, buffer locally without
+losing order, reconnect without hammering the broker, replay what it
+missed, and stay observable while doing all of it. Diagnostics (UDS) and
+anomaly detection sit alongside the telemetry path. This project builds
+each of those pieces small enough to read in an afternoon, and tests them
+end to end.
 
-This repository is being built incrementally, phase by phase, with each
-phase reviewed before the next begins. See [ARCHITECTURE.md](ARCHITECTURE.md)
-for the full architecture, the phase plan, and the reasoning behind every
-major technical decision.
+## Key capabilities
 
-**Current status: Phases 0–10 complete** (Phase 8 was done before
-Phase 7); Phase 11 (final docs/polish) is not started. The paragraphs below describe the most recent
-phases in the order they were completed.
+| Area | What is implemented |
+|---|---|
+| Vehicle simulation | 3 logical ECUs (powertrain 10 Hz, battery 2 Hz, body 1 Hz), 11 CAN messages, seeded random-walk values — [`simulation/`](simulation/), [CAN signal spec](docs/can-signal-spec.md) |
+| Virtual CAN | `python-can` virtual bus: no kernel modules, identical on Windows, Linux, Docker, and CI |
+| CAN decoding | one signal registry (IDs, byte layout, scale, units, valid ranges) shared by the simulator and gateway — [`common/can_signal_map.py`](common/can_signal_map.py) |
+| UDS diagnostics | ISO-TP transport; `DiagnosticSessionControl`, `ReadDataByIdentifier`, `ReadDTCInformation` on the powertrain ECU — [UDS spec](docs/uds-spec.md) |
+| Edge Gateway | ingest → decode → validate (reject out-of-range) → normalize → publish — [gateway spec](docs/edge-gateway-spec.md) |
+| Resilience | SQLite buffer (persistent, bounded), exponential-backoff reconnect (1 s → 30 s cap), strict FIFO replay, at-least-once delivery |
+| MQTT | QoS 1, topic `vehicle/{vehicle_id}/telemetry/{ecu}/{signal}`, `TelemetryEvent` JSON payload |
+| Cloud | AWS IoT Core over mutual TLS, IoT Rule → CloudWatch Logs, all provisioned with Terraform — [AWS setup](docs/aws-setup.md) |
+| Diagnostic analysis | 3 deterministic anomaly rules; optional LLM explanation that is advisory only — [analyzer spec](docs/analyzer-spec.md) |
+| Observability | structured JSON logs, `session_id` per gateway run, `event_id` per event, `GatewayMetrics` counters |
+| Fault injection | named, deterministic scenarios (publish failures, connection outage, malformed/out-of-range frames) |
+| Resilience demo | self-verifying outage → buffering → reconnect → FIFO replay scenario with PASS/FAIL |
+| Engineering dashboard | read-only live view: status, metrics, resilience lifecycle, charts, events, diagnostics, activity |
+| Quality | pytest unit, broker-backed integration, and full-scenario tests; Docker/Compose; GitHub Actions CI |
 
-**Phase 6 (diagnostic analyzer) complete** — a Diagnostic Anomaly Analyzer now
-sits on top of Phase 2's UDS diagnostics: deterministic rules detect
-repeated negative UDS responses, repeated DTC queries, and repeated
-overheating-related (P0217) activity from `DiagnosticEvent`s, and an
-optional LLM layer can add a short advisory explanation to a finding the
-rules already made (never the other way around — see
-[docs/analyzer-spec.md](docs/analyzer-spec.md)). This was moved up from
-its originally-planned Phase 9 slot; see ARCHITECTURE.md's "Phase
-reordering" note. Nothing about Phase 5's cloud integration or Phase 4's
-resilience story changed: a failed publish is still buffered to a
-persistent local SQLite queue, the gateway still keeps ingesting and
-validating CAN traffic through an outage, and it still reconnects
-(exponential backoff, capped at 30s, no background thread) and replays
-everything buffered, in order, once the broker — local or AWS — comes
-back. Combined with Phase 1's simulated 3-ECU network, Phase 2's UDS
-diagnostic server, and Phase 3's ingest/validate/normalize/publish
-pipeline, the system now demonstrates a resilient edge-to-cloud pipeline
-with advisory diagnostic analysis end to end. No dashboard code exists
-yet.
+## Architecture
 
-**Phase 8 (testing & CI hardening) complete** — a full-scenario
-integration test now drives seeded ECUs → virtual CAN → the gateway's
-`run()` loop → a real Mosquitto broker → a real subscriber, CI can no
-longer silently skip the broker-backed tests, and
-[docs/assumptions-and-limitations.md](docs/assumptions-and-limitations.md)
-records the current testing limits.
+```mermaid
+flowchart TB
+    subgraph proc["One Python process (the virtual CAN bus is process-local)"]
+        PT["Powertrain ECU<br/>10 Hz, 3 messages"]
+        BA["Battery ECU<br/>2 Hz, 4 messages"]
+        BO["Body ECU<br/>1 Hz, 4 messages"]
+        BUS(["Virtual CAN bus"])
+        subgraph GW["Edge Gateway"]
+            ING["Ingest + decode<br/>(CAN signal registry)"]
+            VAL["Validate<br/>(range check, reject)"]
+            NORM["Normalize<br/>(topic + TelemetryEvent JSON)"]
+            PUB["MQTT publisher<br/>(QoS 1, backoff reconnect)"]
+            BUF[("SQLite buffer<br/>(FIFO, bounded)")]
+            OBS["Metrics + JSON logs<br/>(session_id, event_id)"]
+        end
+        PT --> BUS
+        BA --> BUS
+        BO --> BUS
+        BUS --> ING --> VAL --> NORM --> PUB
+        PUB -- "publish not acknowledged" --> BUF
+        BUF -- "FIFO replay after reconnect" --> PUB
+    end
+    PUB -- "MQTT (default)" --> MOS["Local Mosquitto<br/>(dev, tests, demos)"]
+    PUB -- "MQTT over mutual TLS :8883<br/>(when AWS_IOT_* is set)" --> IOT["AWS IoT Core"]
+    IOT -- "IoT Rule" --> CW["CloudWatch Logs"]
+```
 
-**Phase 7 (observability) complete** (done after Phase 8) —
-`edge_gateway/metrics.py` gives the gateway one in-process metrics object
-(processed / rejected / publish failures / buffered / replayed, plus the
-buffer's dropped count), logged as a structured `"gateway stopped"`
-summary tagged with the run's `session_id`. `session_id` is the run-level
-correlation ID and `event_id` the per-event identity, both carried in
-gateway logs and every payload — see
-[docs/edge-gateway-spec.md](docs/edge-gateway-spec.md)'s "Observability"
-section. No external metrics system (Prometheus, OpenTelemetry,
-CloudWatch Metrics) is used.
+Diagnostics run beside the telemetry path, over the same virtual bus:
 
-**Phase 9 (resilience demo) complete** — `python -m scenarios.resilience_demo`
-runs a self-verifying MQTT outage → SQLite buffering → reconnect → FIFO
-replay → recovery scenario against local Mosquitto and prints PASS/FAIL
-with real counts (see "Resilience demo" below).
+```mermaid
+flowchart LR
+    T["UDS client"] <-->|"ISO-TP on CAN IDs 0x7E0 / 0x7E8"| S["Powertrain UDS server"]
+    S -->|"DiagnosticEvent per transaction"| A["DiagnosticAnalyzer<br/>(3 deterministic rules)"]
+    A -->|"AnomalyReport"| L["Optional LLM explainer<br/>(advisory text only)"]
+```
 
-**Phase 10 (Engineering Dashboard) complete** — `python -m dashboard.backend`
-serves a read-only engineering dashboard at http://127.0.0.1:8080: live
-telemetry, gateway metrics, the resilience lifecycle, vehicles/ECUs,
-the event stream, diagnostics and activity, plus a few safe demo
-controls (see "Engineering dashboard" below). No new dependencies.
+The dashboard is a separate read-only layer. It is not a stage in the
+telemetry path:
 
-On top of that, this repository has also been made reproducible and
-CI/CD-ready: a `Dockerfile` and an extended `docker/docker-compose.yml`
-run the whole demo in containers, and `.github/workflows/ci.yml` runs the
-full test suite on every push/PR. See "Run with Docker" and "CI/CD"
-below, and ARCHITECTURE.md's "Reproducibility, Docker & CI/CD" section
-for the full reasoning. (This work is orthogonal to the phase-numbered
-feature list above — it hardens everything built so far rather than
-adding a new one.)
+```mermaid
+flowchart LR
+    MQ["MQTT broker<br/>vehicle/+/telemetry/+/+"] -->|"read-only subscription"| D["Engineering Dashboard"]
+    H["Gateway run hosted in the<br/>dashboard's own process"] -->|"GatewayMetrics, connection state,<br/>log records, SQLite depth (read-only)"| D
+    D -->|"HTTP + Server-Sent Events"| B["Browser"]
+```
 
-## Requirements
+Two identifiers tie it together: **`session_id`** identifies one gateway
+run and **`event_id`** identifies one telemetry event. Both travel in
+every payload and on the gateway's log lines. Full detail, diagrams, and
+the decision log are in [ARCHITECTURE.md](ARCHITECTURE.md).
 
-This list grows as each phase introduces a real dependency:
+## Quick start (Windows PowerShell)
 
-- Python 3.11 — standardized across local development, Docker, and CI
-  (see `requirements.txt` for pinned package versions). If your machine's
-  default `python`/`python3` is a different version, use Docker (below)
-  or a `python3.11` interpreter directly instead of changing this
-  project's target version.
-- A local MQTT broker: either `docker compose -f docker/docker-compose.yml up`
-  (Docker & Docker Compose), or install `mosquitto` directly
-  (`apt-get install mosquitto` on Debian/Ubuntu) and run it with
-  `docker/mosquitto/mosquitto.conf`
-- An AWS account, only if you want to run against AWS IoT Core instead of
-  local Mosquitto (Phase 5; all resources are provisioned via Terraform
-  and designed to be torn down cleanly after use — see
-  [docs/aws-setup.md](docs/aws-setup.md))
+Prerequisites: Python 3.11 (via the `py` launcher), Docker Desktop, Git.
+Commands use the virtual environment's interpreter directly, so no
+activation is needed.
 
-## Run locally
+```powershell
+git clone https://github.com/shravaniishinde/edge-to-cloud-automotive-telemetry-poc.git
+cd edge-to-cloud-automotive-telemetry-poc
+py -3.11 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
 
-```bash
-pip install -r requirements.txt   # add --break-system-packages on Debian/Ubuntu system Python
+Start the local MQTT broker, then the dashboard:
 
-# Run the test suite (broker-backed integration tests skip if no broker is running)
-pytest
-
-# Include the real-broker integration tests, incl. the full ECU -> CAN ->
-# gateway -> MQTT scenario test: start only the broker, then run pytest
+```powershell
 docker compose -f docker/docker-compose.yml up -d mosquitto
-pytest -v -rs
-
-# Run the live simulation for 5 seconds, with a fixed seed for reproducible output
-python -m simulation.run_simulation --duration 5 --seed 42
-
-# Same, but log every CAN frame sent (otherwise only start/stop are logged)
-python -m simulation.run_simulation --duration 5 --seed 42 --verbose
 ```
 
-To see the Edge Gateway itself running against a real broker (rather than
-just its tests), start a local Mosquitto broker (see above), then:
-
-```bash
-python run_demo.py --duration 10
+```powershell
+.\.venv\Scripts\python.exe -m dashboard.backend
 ```
 
-This starts all 3 ECUs and the Edge Gateway together (they must share one
-Python process — see [docs/edge-gateway-spec.md](docs/edge-gateway-spec.md)
-for why) and publishes validated telemetry to
-`vehicle/SIM-VEHICLE-01/telemetry/{ecu}/{signal}` topics on the broker.
-Subscribe with `mosquitto_sub -t 'vehicle/#'` in another terminal to watch
-it live.
+Open http://127.0.0.1:8080 and click **Start live demo**. In a second
+terminal you can also run the gateway on its own, or the scripted
+resilience check:
 
-To see Phase 4's resilience story — buffering through an outage, then
-replaying on recovery — while the demo above is running, in a second
-terminal:
-
-```bash
-docker compose -f docker/docker-compose.yml stop mosquitto
-# watch the demo's logs shift from "published telemetry event" to
-# "publish failed -- buffered for replay"
-
-docker compose -f docker/docker-compose.yml start mosquitto
-# watch the logs show "MQTT reconnected" followed by a burst of
-# "replayed buffered events", and mosquitto_sub receive that same burst
-# in original order
+```powershell
+.\.venv\Scripts\python.exe run_demo.py --duration 60
 ```
 
-### Resilience demo (Phase 9)
-
-A scripted, self-checking version of that outage story — no second
-terminal, no timing guesswork, no AWS or Anthropic configuration:
-
-```bash
-docker compose -f docker/docker-compose.yml up -d mosquitto
-python -m scenarios.resilience_demo
+```powershell
+.\.venv\Scripts\python.exe -m scenarios.resilience_demo
 ```
 
-It runs the real ECUs, Edge Gateway, SQLite buffer and MQTT publisher in
-one process (like `run_demo.py`), injects an MQTT connection outage with
-`edge_gateway.fault_injection.simulated_connection_outage()`, and walks
-through six stages: normal telemetry → outage injected → events buffered
-in SQLite (reconnect attempts failing with exponential backoff) → outage
-cleared and the gateway's own backoff-gated reconnect succeeds → the
-buffer is replayed in FIFO order before any new live event → live
-telemetry resumes. Every stage waits on an observed condition with a
-bounded timeout. A real MQTT subscriber checks that every buffered
-`event_id` arrives, in order, with its original identity; the run ends
-with a PASS/FAIL summary (session_id, published/buffered/replayed counts,
-final buffer depth, FIFO and recovery checks, the metrics snapshot) and
-one structured JSON summary line. The exit code is 0 on PASS, 1 on FAIL.
+To watch raw MQTT traffic (Windows has no native `mosquitto_sub`; this
+runs the one inside the broker container):
 
-Options: `--mqtt-host`, `--mqtt-port`, `--vehicle-id`, `--buffer-path`
-(default: a temporary file, removed afterwards), `--outage-events`
-(default 80), and `--show-logs` to also stream the gateway's JSON logs.
-Delivery is at-least-once, not exactly-once — the summary reports any
-duplicates rather than hiding them (none are expected in this controlled
-run). See [docs/assumptions-and-limitations.md](docs/assumptions-and-limitations.md)
-for what the simulated outage does and doesn't exercise.
-
-## Engineering dashboard (Phase 10)
-
-A read/visualization layer over the running system. It never publishes
-telemetry, buffers, replays, or changes the gateway; see ARCHITECTURE.md
-section 12 for the data flow.
-
-```bash
-docker compose -f docker/docker-compose.yml up -d mosquitto
-python -m dashboard.backend          # then open http://127.0.0.1:8080
+```powershell
+docker compose -f docker/docker-compose.yml exec mosquitto mosquitto_sub -t "vehicle/#" -v
 ```
 
-What it shows, all derived from real data:
-
-- **System status:** gateway run state, the gateway `session_id`, the gateway's
-  MQTT connection, telemetry flow (flowing / stale / none), last event
-  time, vehicles and sessions seen, and the dashboard's own broker
-  subscription state.
-- **Gateway metrics:** the real `GatewayMetrics` snapshot (processed, rejected,
-  publish failures, buffered, replayed, dropped). These are cumulative
-  counters, shown separately from the *current* SQLite buffer depth and
-  the receive rate.
-- **Resilience lifecycle:** NORMAL → OUTAGE → BUFFERING → RECONNECTING →
-  REPLAYING → RECOVERED, plus the latest replay batch.
-- **Live telemetry:** charts of speed, RPM, SOC and pack current (60 s window,
-  units on the axes), and the latest value of all 11 signals.
-- **Vehicles / ECUs:** per-vehicle, per-ECU event counts and latest values.
-- **Event stream:** the latest 50 events with `event_id`, `session_id`, topic,
-  and status (live / replayed / late).
-- **Diagnostics:** a UDS session run over the virtual CAN bus through the
-  existing client/server, analyzed by the deterministic rules. No LLM
-  call is made; findings say so.
-- **Activity:** the gateway's own structured log lines (reconnects, buffering,
-  replay, "gateway stopped" summary), with repeats coalesced.
-
-**Demo controls** (fixed actions only; each drives existing components):
-start/stop a live demo (the `run_demo.py` wiring, hosted in the
-dashboard process), inject/clear the existing simulated MQTT outage, run
-the scripted Phase 9 resilience check, and run a UDS diagnostic session.
-
-Telemetry from gateways in *other* processes, such as `python run_demo.py` or
-the Compose `app` container, appears through MQTT. Their `GatewayMetrics`
-live in that other process, so the metrics and resilience panels only
-cover runs hosted by the dashboard. `--external-buffer
-edge_gateway/data/buffer.db` adds a read-only depth reading of
-run_demo.py's buffer.
-
-Options: `--host` (default 127.0.0.1), `--port` (8080), `--mqtt-host`,
-`--mqtt-port`, `--external-buffer`, `--show-logs`. In Docker:
+On Linux/macOS, use `python3.11 -m venv .venv` and `.venv/bin/python`
+instead. A fully containerized run needs no local Python:
+`docker compose -f docker/docker-compose.yml up --build` starts the broker
+plus the `run_demo.py` app, and
 `docker compose -f docker/docker-compose.yml --profile dashboard up --build`
-(the port is published on 127.0.0.1 only). The dashboard has no
-authentication: keep it on localhost.
+also starts the dashboard on http://127.0.0.1:8080.
 
-## Run with Docker
+## Engineering dashboard
 
-Everything above also runs in containers, with no local Python
-installation needed at all:
+`python -m dashboard.backend` serves a single page (standard-library HTTP
+server, plain HTML/CSS/JS, no CDN) that updates once a second. It shows:
 
-```bash
-docker compose -f docker/docker-compose.yml up --build
+- **System status:** gateway run and `session_id`, gateway MQTT
+  connection, telemetry flow, vehicles and sessions seen, and the
+  dashboard's own broker subscription.
+- **Gateway metrics:** processed, rejected, publish failures, buffered,
+  replayed, dropped. These are cumulative counters, shown separately
+  from the *current* SQLite buffer depth.
+- **Resilience lifecycle:** NORMAL → OUTAGE → BUFFERING → RECONNECTING →
+  REPLAYING → RECOVERED, derived only from observable facts.
+- **Live telemetry:** charts for speed, RPM, state of charge and pack
+  current, plus the latest value of all 11 signals.
+- **Vehicles / ECUs, event stream** (with `event_id`, `session_id`, topic,
+  and live / replayed / late status), **diagnostics**, and an **activity**
+  feed of the gateway's own log lines.
+
+**Demo controls** are a fixed list of actions that start existing
+components: start/stop a live demo, inject/clear a simulated MQTT outage,
+run the scripted resilience check, and run a UDS diagnostic session. The
+dashboard never publishes telemetry, buffers, or replays.
+
+No screenshots are committed; the [demo guide](docs/demo-guide.md) walks
+through what to show.
+
+## Resilience demo
+
+The core behaviour this project demonstrates is what happens when the
+broker becomes unreachable. In the dashboard, click **Inject MQTT
+outage**, wait, then **Clear outage**, and watch the lifecycle move:
+
+| Stage | What is happening |
+|---|---|
+| NORMAL | Telemetry publishes and the broker acknowledges each event (QoS 1). |
+| OUTAGE | The publisher is disconnected; nothing buffered yet. |
+| BUFFERING | ECUs keep sending and the gateway keeps validating. Every event that can't be published goes into the local SQLite buffer. Reconnect attempts back off 1 s, 2 s, 4 s … (capped at 30 s). |
+| RECONNECTING | The outage is over; the gateway notices on its next backoff-timed attempt. |
+| REPLAYING | The buffer is drained oldest-first, before any new live event, keeping each event's original `event_id` and `session_id`. |
+| RECOVERED | The buffer is empty; buffered = replayed; live telemetry continues. |
+
+`python -m scenarios.resilience_demo` runs the same story as a
+self-checking script. It verifies with a real MQTT subscriber that every
+buffered `event_id` arrives, in FIFO order, with its identity intact, then
+prints PASS/FAIL with the actual counts and exits non-zero on failure.
+
+Delivery is **at-least-once**, not exactly-once: a buffered row is deleted
+only after the broker acknowledges it, so an event can arrive more than
+once but is not lost while it is in the buffer. See
+[Known limitations](#known-limitations).
+
+## AWS IoT Core
+
+Local Mosquitto is the default for everything, including CI. The same
+gateway code can publish to AWS IoT Core instead:
+
+- **Provisioning:** Terraform in [`infra/`](infra/) creates the IoT
+  Thing, an X.509 device certificate, a least-privilege IoT policy
+  (connect only as the Thing's client ID, publish only to `vehicle/*`),
+  an IoT Rule `SELECT * FROM 'vehicle/+/telemetry/+/+'`, and a CloudWatch
+  Logs group (region `ap-south-1` by default).
+- **Transport:** MQTT over mutual TLS on port 8883, using the same
+  `MqttPublisher` with optional TLS arguments. No AWS SDK is needed at
+  runtime.
+- **Selection:** set `AWS_IOT_ENDPOINT`, `AWS_IOT_CA_PATH`,
+  `AWS_IOT_CERT_PATH`, `AWS_IOT_KEY_PATH`, and
+  `AWS_IOT_CLIENT_ID=edge-to-cloud-telemetry-poc-vehicle` (the policy
+  requires it). A partial configuration is an error, never a silent
+  fallback to Mosquitto.
+- **Secrets:** certificates, private keys, `.env`, and Terraform state
+  are gitignored and never committed.
+- **Verification:** the existing smoke test
+  (`edge_gateway/tests/test_aws_iot_integration.py`) passed against the
+  provisioned endpoint, and the AWS IoT MQTT test client received its
+  `{"smoke_test": true}` message.
+
+Step-by-step setup, the smoke-test command, and teardown are in
+[docs/aws-setup.md](docs/aws-setup.md).
+
+## Testing
+
+| Check | Latest verified result |
+|---|---|
+| Full pytest suite, local Mosquitto running, `MQTT_BROKER_REQUIRED=1` | 226 passed, 1 skipped (the AWS test, which needs real AWS configuration) |
+| Full pytest suite, no broker (broker tests skip with a reason) | 212 passed, 15 skipped |
+| AWS IoT smoke test (manual, needs real AWS configuration) | 1 passed |
+
+The suite covers unit tests per module; broker-backed integration tests
+(real Mosquitto, real subscriber); a full-scenario test (seeded ECUs →
+virtual CAN → gateway → MQTT → subscriber); the resilience demo; and the
+dashboard's state, HTTP API, and real-chain integration tests. No test
+makes a real Anthropic API call, and the AWS test skips unless AWS is
+configured.
+
+```powershell
+$env:MQTT_BROKER_REQUIRED = "1"; .\.venv\Scripts\python.exe -m pytest -v -rs
 ```
 
-This builds `docker/Dockerfile` (Python 3.11, matching this project's
-standardized runtime — see "Requirements" above) and starts two
-containers: `mosquitto` (the same broker as above) and `app`, which runs
-`run_demo.py` exactly as it runs locally. `app` waits for `mosquitto` to
-actually be accepting connections (a Docker healthcheck) before it
-starts, so there's no manual ordering to get right. Watch both
-containers' logs with the command above, or `docker compose -f
-docker/docker-compose.yml logs -f app` for just the demo. Stop everything
-with Ctrl+C, or `docker compose -f docker/docker-compose.yml down`.
+**CI** ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs on
+every push and pull request to `main`. It does a syntax check with
+`compileall`, installs dependencies, validates the Compose file, installs
+and waits for Mosquitto, then runs the full suite with
+`MQTT_BROKER_REQUIRED=1`, so broker tests fail rather than silently skip.
+CI needs no AWS or Anthropic credentials.
 
-The same Phase 4 outage demo works here too — `docker compose -f
-docker/docker-compose.yml stop mosquitto` / `start mosquitto` in another
-terminal while `up` is running, exactly as described above.
+## Project structure
 
-**Why one `app` container, not separate simulator/gateway containers:**
-`python-can`'s virtual CAN bus only shares frames *within one OS
-process*, so the 3 simulated ECUs and the Edge Gateway run together, as
-threads inside this single container — splitting them into two
-containers would leave the gateway with no bus traffic to read. See
-`docker/Dockerfile`'s own comments and
-[docs/edge-gateway-spec.md](docs/edge-gateway-spec.md).
-
-`app` needs no AWS or Anthropic credentials to run — see
-`docker/docker-compose.yml`'s comments for how to optionally point it at
-AWS IoT Core instead of local Mosquitto, or enable the analyzer's
-advisory LLM layer, both purely via environment variables (never baked
-into the image).
-
-## CI/CD
-
-Every push and pull request to `main` runs
-[`.github/workflows/ci.yml`](.github/workflows/ci.yml) on GitHub-hosted
-Ubuntu runners: checkout → Python 3.11 → a fast syntax check → install
-`requirements.txt` → install and start a local Mosquitto broker (via
-`apt-get`, since GitHub-hosted runners don't guarantee a working Docker
-daemon), wait until it's listening → `pytest -v -rs`. It also validates
-`docker/docker-compose.yml` with `docker compose config` (no image build).
-CI sets `MQTT_BROKER_REQUIRED=1`, so the real-broker integration tests —
-including the full-scenario ECU → CAN → gateway → MQTT test — *fail*
-rather than silently skip if the broker isn't reachable. A failing test
-fails the workflow run, visible directly on the commit/PR.
-
-CI requires **no secrets or paid services**: no AWS credentials, no AWS
-IoT Core resources, and no `ANTHROPIC_API_KEY`. Tests that need those
-(the AWS IoT smoke test, and anything that would make a real Anthropic
-API call) are written to skip safely when they're absent, and the
-repo-root `conftest.py` strips `ANTHROPIC_API_KEY` from every test's
-environment so no test can make a real API call — CI proves the
-simulator, UDS diagnostics, Edge Gateway (including against a real local
-Mosquitto broker), buffering/resilience, and the deterministic analyzer
-rules all work; it does not prove connectivity to a real AWS account,
-which is inherently something only a run with real credentials can show.
-See ARCHITECTURE.md's "Reproducibility, Docker & CI/CD" section for
-exactly which tests run in CI vs. which require real AWS credentials.
-
-## Cloud (AWS IoT Core)
-
-Local Mosquitto is still the default — nothing above changes. To publish
-the same telemetry to a real AWS IoT Core endpoint instead:
-
-1. Provision AWS IoT Core with Terraform and set four environment
-   variables it prints (`AWS_IOT_ENDPOINT`, `AWS_IOT_CA_PATH`,
-   `AWS_IOT_CERT_PATH`, `AWS_IOT_KEY_PATH`) — see
-   [docs/aws-setup.md](docs/aws-setup.md) for the exact steps.
-2. Run `python run_demo.py` exactly as before. With all four variables
-   set, it connects to AWS IoT Core over MQTT/TLS instead of local
-   Mosquitto; with none set, it's unchanged. Setting only *some* of them
-   is treated as a configuration error and the gateway refuses to
-   start — it never silently falls back to local Mosquitto.
-
-The same topic scheme and JSON payload are used either way; only the
-broker and its TLS/authentication differ. See
-[docs/edge-gateway-spec.md](docs/edge-gateway-spec.md)'s "Publishing to
-AWS IoT Core" section for how the gateway decides which broker to use,
-and [ARCHITECTURE.md](ARCHITECTURE.md) for why Kinesis is deliberately
-not part of this phase.
-
-## Diagnostic Anomaly Analyzer
-
-The analyzer consumes `DiagnosticEvent`s (the same objects
-`simulation/uds/uds_server.py` already produces per UDS transaction) and
-is completely independent of the live UDS server or bus — pass it any
-list of events, e.g. from `simulation/uds/tests/test_uds_integration.py`'s
-`events_received` collection pattern:
-
-```python
-from analyzer import DiagnosticAnalyzer
-
-analyzer = DiagnosticAnalyzer()
-reports = analyzer.analyze(events_received)  # a List[DiagnosticEvent]
-for report in reports:
-    print(report.severity.value, report.title)
+```
+├── simulation/          3 ECUs, virtual CAN helpers, UDS client/server (simulation/uds/)
+├── common/              shared schemas: TelemetryEvent, DiagnosticEvent, CAN signal registry
+├── edge_gateway/        ingest, validate, normalize, MQTT publisher, SQLite buffer,
+│                        metrics, logging, fault injection, local-vs-AWS selection
+├── analyzer/            deterministic anomaly rules + optional LLM explainer
+├── scenarios/           resilience_demo.py (self-verifying outage/recovery)
+├── dashboard/           backend/ (stdlib HTTP + SSE), frontend/ (HTML/CSS/JS), tests/
+├── infra/               Terraform: IoT Thing, certificate, policy, IoT Rule, CloudWatch Logs
+├── docker/              Dockerfile, docker-compose.yml, Mosquitto config
+├── docs/                specifications, AWS setup, limitations, demo guide, project summary
+├── run_demo.py          ECUs + gateway in one process, publishing to MQTT
+└── .github/workflows/   CI
 ```
 
-This works with **no configuration at all** — the three deterministic
-rules (repeated negative responses, repeated DTC queries, repeated
-P0217/overheating activity) need nothing but the events themselves. An
-optional advisory explanation can be added afterward, only if
-`ANTHROPIC_API_KEY` is set:
+## Engineering decisions
 
-```python
-from analyzer.llm_explainer import explain_anomaly
+| Decision | Why |
+|---|---|
+| `python-can` virtual bus | Needs no kernel module or privileges, so it behaves the same on Windows, Docker, and CI. The trade-off is that it only works within one process, so ECUs and gateway run as threads together. |
+| SQLite for the buffer | Standard library, no extra service, transactional, and it survives a gateway restart. |
+| Strict FIFO replay | Telemetry is a time series; replay stops at the first unacknowledged row rather than sending later events ahead of it. |
+| At-least-once delivery | A row is deleted only after a broker acknowledgement. Exactly-once would need a transaction spanning broker and database, which this POC doesn't need to demonstrate. |
+| Kinesis deferred | CloudWatch Logs via an IoT Rule proves telemetry reaches the cloud. Fan-out, if ever needed, is another IoT Rule action, with no gateway change. |
+| Rules detect, LLM explains | Anomaly detection is deterministic and testable. The LLM layer can only add explanation text after the fact, and the analyzer never imports it. |
+| Read-only dashboard | Visualization must not change what it observes. Metrics are shown only where they can actually be read, never estimated. |
+| Local Mosquitto by default | Repeatable demos and a CI that needs no cloud account or cost. AWS is the same code with different configuration. |
 
-for report in reports:
-    report.llm_explanation = explain_anomaly(report, events_received)  # None if not configured
-```
+## Known limitations
 
-See [docs/analyzer-spec.md](docs/analyzer-spec.md) for the full rule
-descriptions, configurable time windows, severity levels, known false
-positive/negative patterns, and exactly what the LLM layer is and isn't
-allowed to do.
+- The virtual CAN bus is process-local: simulator and gateway must share
+  one process (and one container).
+- The dashboard reads real `GatewayMetrics` only for gateway runs it
+  hosts. Other gateways are visible through their MQTT telemetry only.
+  History is in memory, bounded, and lost on restart.
+- The dashboard has no authentication. It binds to localhost and should
+  stay there.
+- Diagnostics run on demand (a fixed UDS script); there is no live
+  diagnostic stream. The UDS server's DTC list is static.
+- The scripted outage is simulated at the publisher, not on the network.
+  A real `docker compose stop mosquitto` works too, but behaves
+  differently, as the next point describes.
+- During a **real** broker outage, the publisher can report "connected"
+  while publishes fail, and duplicate deliveries have been observed
+  (about two extra copies per buffered event in one test). No data was
+  lost, and this is within at-least-once semantics, but it is not yet
+  root-caused.
+- Kinesis, DynamoDB/S3 persistence, and production security hardening
+  are intentionally out of scope.
 
-See "Engineering dashboard" below for the Phase 10 visual view. See
-[ARCHITECTURE.md](ARCHITECTURE.md) for the full phase plan,
-[docs/can-signal-spec.md](docs/can-signal-spec.md) for exactly what the
-simulated vehicle transmits, [docs/uds-spec.md](docs/uds-spec.md) for the
-UDS diagnostic services the Powertrain ECU supports,
-[docs/edge-gateway-spec.md](docs/edge-gateway-spec.md) for the Edge
-Gateway's ingest/validate/normalize/publish pipeline, and
-[docs/analyzer-spec.md](docs/analyzer-spec.md) for the Diagnostic Anomaly
-Analyzer.
+The full, per-phase record is in
+[docs/assumptions-and-limitations.md](docs/assumptions-and-limitations.md).
+
+## Future improvements
+
+These are ideas, not gaps in the current POC:
+
+- Root-cause the duplicate MQTT deliveries seen during real broker outages
+  (likely paho re-sending queued QoS 1 messages that the gateway also
+  replays).
+- A persistent observability backend, if metrics need to outlive a run.
+- Authentication for the dashboard before it ever leaves localhost.
+- Cloud-side streaming (for example Kinesis) if multiple consumers need
+  live telemetry.
+
+## Documentation
+
+| Document | Contents |
+|---|---|
+| [ARCHITECTURE.md](ARCHITECTURE.md) | components, data flow, diagrams, full decision log, phase history |
+| [docs/demo-guide.md](docs/demo-guide.md) | a 10-minute walkthrough for presenting the project |
+| [docs/project-summary.md](docs/project-summary.md) | short explanations, interview Q&A, resume bullets |
+| [docs/can-signal-spec.md](docs/can-signal-spec.md) | the 11 CAN messages: IDs, layout, scaling, ranges |
+| [docs/uds-spec.md](docs/uds-spec.md) | UDS services, DIDs, DTCs, ISO-TP setup |
+| [docs/edge-gateway-spec.md](docs/edge-gateway-spec.md) | gateway pipeline, resilience, observability, AWS publishing |
+| [docs/analyzer-spec.md](docs/analyzer-spec.md) | anomaly rules, thresholds, what the LLM may and may not do |
+| [docs/aws-setup.md](docs/aws-setup.md) | Terraform provisioning, environment variables, smoke test, teardown |
+| [docs/assumptions-and-limitations.md](docs/assumptions-and-limitations.md) | every assumption and limitation, by phase |

@@ -567,3 +567,16 @@ Phase 7 was implemented after Phase 8, on top of the audit above.
   behaviour are tested with a real server. The page itself was checked
   manually in a browser (live demo, outage/recovery, diagnostics), not by
   an automated UI test.
+
+## Phase 11 (final documentation)
+
+- Phase 11 changed documentation only; no application, test, Terraform,
+  Docker, or CI behaviour changed.
+- `.env.example` previously used the project's real AWS IoT data endpoint
+  as its "example" value. It now uses a placeholder. The old value remains
+  in git history. An IoT endpoint is not a credential (authentication is
+  the device certificate and private key, which were never committed),
+  but it does identify the account's endpoint.
+- `AWS_IOT_CLIENT_ID` is now documented as required in practice: the IoT
+  policy only allows connecting as the Thing name, while the loader treats
+  the client ID as optional (see `docs/aws-setup.md`).

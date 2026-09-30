@@ -1,10 +1,12 @@
 # Architecture & Phase Plan
 
-Status: Phases 0-10 complete (Phase 8 was done before Phase 7 -- see the
-Phase 7/8 ordering note below); Phase 11 not started. Implementation proceeds phase by phase; each
-phase is reviewed before the next begins. This document is the single
-source of truth for *why* the system is shaped the way it is — update it
-whenever a phase changes or adds a decision.
+Status: **complete** -- Phases 0-11 are done (Phase 8 was carried out
+before Phase 7; see the ordering note below). The project was built phase
+by phase, each reviewed before the next began. This document is the
+single source of truth for *why* the system is shaped the way it is: its
+components and data flow (sections 1-2), the decision log (section 3),
+and the detailed design of each later addition (sections 9-12). For a
+quick overview, start with [README.md](README.md).
 
 **Phase reordering (Phase 6):** the original phase plan (see section 5)
 had the AI-assisted analyzer at Phase 9, after Observability, Testing/CI
@@ -25,10 +27,9 @@ feature-numbered Phase 7 ("Observability," `edge_gateway/metrics.py`)
 this section's table still lists below. To avoid silently renumbering an
 approved phase plan, that work is documented in its own section (9,
 below) rather than folded into "Phase 7" in the table. The feature-phase
-numbering in section 5 is otherwise unchanged and still applies going
-forward — resolve this naming overlap explicitly (e.g. rename the
-table's Phase 7, or keep both, whichever you prefer) before it causes
-confusion later.
+numbering in section 5 is otherwise unchanged. (Resolved: the
+reproducibility pass stays documented as section 9, and the feature
+phases kept their original numbers.)
 
 **Phase 7/8 ordering note (Phase 8):** Phase 8 (Testing & CI hardening)
 was carried out before Phase 7 (Observability). Phase 8 needed nothing
@@ -53,27 +54,60 @@ stays reasonable for a personal project.
 
 ## 2. System architecture
 
+**Telemetry path.** Everything inside the box runs as threads in one
+Python process, because the virtual CAN bus is process-local (see the
+correction below).
+
+```mermaid
+flowchart TB
+    subgraph proc["One Python process"]
+        PT["Powertrain ECU<br/>10 Hz, CAN 0x100-0x102"]
+        BA["Battery ECU<br/>2 Hz, CAN 0x200-0x203"]
+        BO["Body ECU<br/>1 Hz, CAN 0x300-0x303"]
+        BUS(["Virtual CAN bus (python-can 'virtual')"])
+        subgraph GW["Edge Gateway (edge_gateway/)"]
+            ING["ingestion.py<br/>filter telemetry IDs, decode"]
+            VAL["validation.py<br/>range check, reject"]
+            NORM["normalization.py<br/>topic + TelemetryEvent JSON"]
+            PUB["mqtt_publisher.py<br/>QoS 1, PUBACK-confirmed, backoff reconnect"]
+            BUF[("buffer.py<br/>SQLite, FIFO, bounded")]
+            OBS["metrics.py + logging_config.py<br/>GatewayMetrics, JSON logs"]
+        end
+        PT --> BUS
+        BA --> BUS
+        BO --> BUS
+        BUS --> ING --> VAL --> NORM --> PUB
+        PUB -- "publish not acknowledged" --> BUF
+        BUF -- "FIFO replay after reconnect / at startup" --> PUB
+    end
+    PUB -- "default" --> MOS["Local Mosquitto"]
+    PUB -- "mutual TLS :8883 when AWS_IOT_* set<br/>(cloud_publisher.py decides)" --> IOT["AWS IoT Core"]
+    IOT -- "IoT Rule SELECT * FROM 'vehicle/+/telemetry/+/+'" --> CW["CloudWatch Logs"]
 ```
-[Powertrain ECU] [Battery ECU] [Body ECU]   (3 logical ECUs, each its own
-        \             |             /        thread within one process —
-         \            |            /         see the correction below)
-          virtual CAN bus (python-can "virtual" interface)
-                      |
-         UDS diagnostic client <-> one ECU acting as UDS server
-                      |
-              Edge Gateway
-   ingest -> validate -> normalize -> structured log (session/correlation ID)
-   -> publish attempt -> [success: MQTT] / [failure: SQLite buffer]
-   -> retry/backoff -> replay buffer on reconnect
-   -> local metrics (processed, failed, buffered, replayed)
-                      |
-        MQTT broker: Mosquitto (dev/test) or AWS IoT Core (cloud demo)
-                      |
-        IoT Rule -> CloudWatch Logs + Metrics
-                      |
-   Engineering Dashboard (Phase 10): read-only MQTT subscriber + gateway runs hosted
-   in its own process -> stdlib HTTP + Server-Sent Events -> browser (section 12)
+
+**Diagnostics path.** UDS shares the virtual bus (CAN IDs 0x7E0/0x7E8,
+which the gateway ignores) but is not part of the telemetry path.
+
+```mermaid
+flowchart LR
+    C["UDS client<br/>(simulation/uds/uds_client.py)"] <-->|"ISO-TP"| S["PowertrainUDSServer"]
+    S -->|"DiagnosticEvent per transaction"| A["DiagnosticAnalyzer<br/>3 deterministic rules"]
+    A -->|"AnomalyReport"| L["llm_explainer.py (optional)<br/>fills llm_explanation only"]
 ```
+
+**Read side.** The Engineering Dashboard observes; it is not a stage in
+the pipeline (section 12).
+
+```mermaid
+flowchart LR
+    MQ["MQTT broker"] -->|"subscribe vehicle/+/telemetry/+/+"| D["dashboard/backend"]
+    H["gateway run hosted in the dashboard process"] -->|"metrics, connection state, log records,<br/>SQLite depth (read-only)"| D
+    D -->|"HTTP + Server-Sent Events"| B["browser"]
+```
+
+**Identity.** `session_id` identifies one gateway run (one `EdgeGateway`
+instance) and `event_id` identifies one telemetry event; both are minted
+by the gateway and carried in every payload (section 10).
 
 **Correction found during Phase 1 planning:** `python-can`'s virtual
 interface shares frames between `Bus` objects only *within the same OS
@@ -121,10 +155,13 @@ developer's own machine or CI). See `docs/edge-gateway-spec.md`.
   unreachable, retrying with backoff, replaying buffered data on recovery,
   and exposing operational metrics.
 - **Cloud pipeline** — AWS IoT Core as the MQTT entry point, with an IoT
-  Rule routing accepted telemetry to CloudWatch Logs/Metrics.
+  Rule routing accepted telemetry to CloudWatch Logs.
 - **Analyzer** — a deterministic rule engine that performs the actual
-  anomaly detection, plus an LLM pass that only explains/summarizes what
+  anomaly detection, plus an optional LLM step that only explains what
   the rules already flagged.
+- **Resilience demo** (Phase 9) — `scenarios/resilience_demo.py`, a
+  self-verifying outage/recovery scenario built from the components
+  above (section 11).
 - **Dashboard** (Phase 10) — reads the Edge Gateway's own live state
   (not AWS, not fabricated data): telemetry via a read-only MQTT
   subscription, metrics from gateway runs it hosts in its own process,
@@ -144,7 +181,7 @@ developer's own machine or CI). See `docs/edge-gateway-spec.md`.
 | Cloud persistence limited to IoT Core + CloudWatch (no DynamoDB/S3 yet) | The resilience story is fully provable from Edge Gateway metrics plus CloudWatch logs alone. Added persistence is deferred until there's a genuine need (e.g. the dashboard needing to read telemetry back from the cloud side). |
 | Dashboard reads from the Edge Gateway, not from AWS | Keeps the dashboard honest ("no independently-simulated data") and responsive, since the gateway already holds all the state the dashboard needs to show. |
 | LLM analysis is batch/on-demand, never real-time per-message | Avoids latency, cost, and CI flakiness. The deterministic rule engine is authoritative for anomaly detection; the LLM's output is always labeled advisory and is mocked in automated tests. |
-| Shared telemetry data model (`common/`) | A single canonical schema (analogous to a DBC file's role in a real vehicle network) used by the simulator, Edge Gateway, cloud integration, analyzer, and dashboard, so all components agree on one event shape instead of drifting JSON conventions. Introduced incrementally: `TelemetryEvent` (Phase 1), `DiagnosticEvent` (Phase 2), an operational/metrics event shape (Phase 4/6). |
+| Shared telemetry data model (`common/`) | A single canonical schema (analogous to a DBC file's role in a real vehicle network) used by the simulator, Edge Gateway, cloud integration, analyzer, and dashboard, so all components agree on one event shape instead of drifting JSON conventions. Introduced incrementally: `TelemetryEvent` (Phase 1), `DiagnosticEvent` (Phase 2); the planned operational schema turned out to be unnecessary (buffer rows are plain SQLite columns, and metrics are `MetricsSnapshot` in `edge_gateway/metrics.py`, Phase 7). |
 | Repository scaffolding is incremental | Directories and files are created only when the phase that needs them begins — the structure below is the destination, not something built upfront. |
 | Dependency management via plain `requirements.txt` | Kept intentionally simple (no Poetry/pyproject) and starts empty, gaining entries only as each phase introduces a real dependency. Versions are pinned exactly to what was installed and tested against. |
 | CI introduced early, grown incrementally | A minimal GitHub Actions workflow appears at Phase 1 and runs whatever test suite exists at the time, rather than being bolted on at the end. |
@@ -162,7 +199,7 @@ developer's own machine or CI). See `docs/edge-gateway-spec.md`.
 | Reconnect is paced by the gateway's own loop, not a dedicated thread | `try_reconnect()` is a cheap timestamp check most of the time, gated by exponential backoff (1s, doubling, capped at 30s); `EdgeGateway.run_once()` calls it once per iteration. Keeps retry timing simple and explainable without adding a second thread's worth of lifecycle/shutdown concerns for what a POC needs. |
 | Buffer replay stops at the first unconfirmed row instead of skipping ahead | Preserves strict FIFO ordering -- correct for time-series signals -- at the cost of one slow/failing event blocking everything behind it until it either confirms or the connection drops again. Accepted: correctness of order matters more here than replay throughput. |
 | Delivery guarantee is at-least-once, not exactly-once | A buffered row is deleted only after a real broker PUBACK (verified from paho-mqtt's own source, not assumed); the accepted gap is a possible duplicate replay if the process crashes between that acknowledgement and the delete. Closing that gap fully needs a distributed transaction this POC doesn't need to demonstrate. (Phase 10 manual testing also observed duplicates during a *real* broker outage, with no crash -- see `docs/assumptions-and-limitations.md`, Phase 10 section; still within at-least-once, not yet root-caused.) |
-| Fault injection is 4 named scenarios, not a chaos framework | Deterministic and interview-explainable: force N publish failures, a malformed frame, an out-of-range frame, plus a real `docker compose stop` for the actual outage demo. A randomized chaos-monkey approach would add flakiness and complexity with no corresponding teaching value at this scale. |
+| Fault injection is a few named scenarios, not a chaos framework | Deterministic and interview-explainable: force N publish failures, a malformed frame, an out-of-range frame, and (added in Phase 9) a simulated connection outage; a real `docker compose stop` remains available for a genuine broker outage. A randomized chaos-monkey approach would add flakiness and complexity with no corresponding teaching value at this scale. |
 | AWS IoT Core support extends `MqttPublisher` with optional TLS args, not a second publisher class | AWS IoT Core is plain MQTT over TLS -- the exact protocol `MqttPublisher` already speaks. Adding `tls_ca_certs`/`tls_certfile`/`tls_keyfile` as optional constructor args (all-or-nothing, or a `ValueError`) keeps exactly one publish/reconnect/backoff implementation, unchanged from Phase 4, rather than duplicating that logic in a `CloudPublisher` subclass. No new AWS SDK dependency is needed as a result. |
 | Local-vs-AWS selection lives in `edge_gateway/cloud_publisher.py`, not in `gateway.py` or CLI flags | `EdgeGateway` still just receives an already-constructed `MqttPublisher` -- it has no idea, and doesn't need to know, whether that publisher is talking to Mosquitto or AWS IoT Core. Reading environment variables and deciding which to build is a separate, independently testable concern. |
 | Partial AWS configuration fails fast, never falls back to local Mosquitto | Deliberate: a half-configured AWS setup silently talking to a developer's local broker instead would be a confusing, hard-to-notice failure mode. `cloud_publisher.py` raises `AwsIotConfigError` (uncaught) the moment some but not all `AWS_IOT_*` variables are set, or a configured certificate file doesn't exist. |
@@ -179,15 +216,13 @@ developer's own machine or CI). See `docs/edge-gateway-spec.md`.
 | One `app` container runs `run_demo.py` unmodified; no separate simulator/gateway containers | `python-can`'s virtual bus is process-local (the same Phase 1 finding behind "Edge Gateway runs in the same process as the ECUs," above) -- it doesn't survive a process boundary, let alone a container boundary. `docker/Dockerfile`'s `CMD` is the existing entry point, not a new one invented for Docker. |
 | `docker-compose.yml`'s `app` service depends on Mosquitto's healthcheck, not just container start | `MqttPublisher.connect()` is a synchronous call that raises if the broker isn't yet accepting connections -- Compose's default `depends_on` (container *started*, not *ready*) would make `app` crash on a cold `docker compose up` the moment Mosquitto's own startup is slower than usual. A `mosquitto_pub`-based healthcheck plus `condition: service_healthy` closes that race without touching application code. |
 | AWS IoT Core is never modeled as a Compose service | It's a real external AWS resource (see section 7), not a local process this project could stand up in a container -- adding a fake "aws-iot" container would misrepresent the architecture. `app`'s `AWS_IOT_*` environment variables are all unset (blank) by default in `docker-compose.yml`, which keeps it talking to the real `mosquitto` service exactly like every other local run. |
-| CI keeps installing Mosquitto via `apt-get`, not via Docker-in-Docker | Reconfirmed, not redesigned, during the reproducibility pass: GitHub-hosted runners don't guarantee a working Docker daemon, but `apt-get install mosquitto` reliably starts it as a systemd service. This is the same broker mechanism `docker/docker-compose.yml` provides for local dev -- just started a different way -- so CI still runs the real `mosquitto_broker`-fixture tests, not just the ones that skip without a broker. Confirmed by running the suite with and without a broker present: 154 passed/7 skipped without one, 160 passed/1 skipped (the AWS smoke test) with one. |
+| CI keeps installing Mosquitto via `apt-get`, not via Docker-in-Docker | Reconfirmed, not redesigned, during the reproducibility pass: GitHub-hosted runners don't guarantee a working Docker daemon, but `apt-get install mosquitto` reliably starts it as a systemd service. This is the same broker mechanism `docker/docker-compose.yml` provides for local dev -- just started a different way -- so CI still runs the real `mosquitto_broker`-fixture tests, not just the ones that skip without a broker. Confirmed at the time by running the suite with and without a broker present: 154 passed/7 skipped without one, 160 passed/1 skipped (the AWS smoke test) with one. |
 | `python -m compileall` added as a CI step before dependency installation | A plain syntax error fails in seconds, before the slower `apt-get`/`pip install` steps run -- "lightweight syntax/import check" from the reproducibility requirements, kept genuinely lightweight (no extra dependency, no import of third-party packages) rather than a second, redundant test runner. |
-| No Dockerfile `HEALTHCHECK`, no dashboard/API port exposed | `app` is an MQTT *client*, not a server -- it has no port for anything to connect to, and nothing external polls its health (Compose's `restart: on-failure` is the safety net if it crashes). Keeps the image to exactly what running `run_demo.py` needs, per this pass's "avoid unnecessary complexity" constraint. |
+| No Dockerfile `HEALTHCHECK` or `EXPOSE` | `app` is an MQTT *client*, not a server -- it has no port for anything to connect to, and nothing external polls its health (Compose's `restart: on-failure` is the safety net if it crashes). The Phase 10 `dashboard` service reuses the same image with a different command, and its port is published by Compose, on 127.0.0.1 only, behind an opt-in profile. |
 
-## 4. Target repository structure
+## 4. Repository structure
 
-Built incrementally — each item is tagged with the phase that creates it.
-Items marked **done** exist in the repo today; everything else is still
-just the target destination.
+Built incrementally — each item is tagged with the phase that created it.
 
 ```
 edge-to-cloud-automotive-telemetry-poc/
@@ -200,13 +235,14 @@ edge-to-cloud-automotive-telemetry-poc/
 │   ├── uds-spec.md                      [Phase 2 — done]
 │   ├── edge-gateway-spec.md             [Phase 3 — done]
 │   ├── aws-setup.md                     [Phase 5 — done]
-│   └── analyzer-spec.md                 [Phase 6 — done]
+│   ├── analyzer-spec.md                 [Phase 6 — done]
+│   ├── demo-guide.md                    [Phase 11 — 10-minute presentation walkthrough — done]
+│   └── project-summary.md               [Phase 11 — explanations, interview Q&A, resume bullets — done]
 ├── common/                              [Phase 1 — shared schema package — done]
 │   ├── telemetry_schema.py              [Phase 1 — TelemetryEvent — done]
 │   ├── can_signal_map.py                [Phase 1 — 11-message CAN registry + encode/decode — done]
 │   ├── diagnostic_schema.py             [Phase 2 — DiagnosticEvent — done]
-│   ├── tests/                           [Phase 1, extended Phase 2 — done]
-│   └── operational_schema.py            [Phase 4/6 — buffer/metric events]
+│   └── tests/                           [Phase 1, extended Phase 2 — done]
 ├── simulation/                          [Phase 1 — done]
 │   ├── can_bus.py                       [Phase 1 — virtual bus + send/run helpers — done]
 │   ├── ecus/                            [Phase 1 — powertrain/battery/body — done]
@@ -252,34 +288,41 @@ edge-to-cloud-automotive-telemetry-poc/
 | 8 | Testing & CI hardening — **done** | full pytest suite, one full-scenario integration test (`edge_gateway/tests/test_full_scenario_integration.py`), expanded CI, finalized `assumptions-and-limitations.md` |
 | 9 | Resilience demo — **done** | `scenarios/resilience_demo.py`, `scenarios/tests/`, `simulated_connection_outage()` in `edge_gateway/fault_injection.py` |
 | 10 | Engineering Dashboard — **done** | `dashboard/backend/`, `dashboard/frontend/`, `dashboard/tests/`, optional `dashboard` Compose service |
-| 11 | Final docs & polish | architecture diagram, interview talking-points doc |
+| 11 | Final docs & polish — **done** | README as landing page, Mermaid architecture diagrams, `docs/demo-guide.md`, `docs/project-summary.md`, AWS client-ID documentation, stale-reference cleanup |
 
 Each phase follows: **PLAN → EXPLAIN → IMPLEMENT → VERIFY → DOCUMENT**, and
 implementation does not begin on a phase until it has been explicitly
 approved.
 
-## 6. Final end-to-end demonstration (target)
+## 6. End-to-end demonstration
 
-The 3 ECUs and the virtual CAN bus start up. A UDS diagnostic session reads
-a simulated fault code from the powertrain ECU. The Edge Gateway ingests,
-validates, normalizes, and publishes telemetry to AWS IoT Core over MQTT,
-with structured logs carrying a session ID from ECU through gateway to
-cloud. Fault injection then cuts cloud connectivity; the gateway keeps
-running and buffers incoming telemetry to SQLite instead of crashing, and
-its metrics show the buffered count climbing. Connectivity is restored;
-the gateway detects it, replays the buffer in order, and metrics show the
-replayed count matching what was buffered, with the buffer draining to
-zero and no data loss. CloudWatch logs and the gateway's own logs together
-tell the whole story from a single correlation ID. Optionally, the
-analyzer then runs over that session's logs and returns deterministic
-rule findings plus an LLM summary explicitly labeled as advisory.
+The original target, as it can now be shown (see
+[docs/demo-guide.md](docs/demo-guide.md) for a timed walkthrough):
+
+1. The 3 ECUs and the virtual CAN bus start; the gateway ingests,
+   validates, normalizes, and publishes telemetry over MQTT (local
+   Mosquitto by default, AWS IoT Core with the `AWS_IOT_*` configuration),
+   every payload and log line carrying the gateway's `session_id`.
+2. A simulated connection outage is injected. The gateway keeps running,
+   buffers incoming telemetry to SQLite, and its metrics show buffered
+   events climbing.
+3. The outage clears; the gateway's backoff-timed reconnect succeeds, the
+   buffer replays in FIFO order before any new live event, and the
+   metrics show replayed = buffered with the buffer back at zero.
+4. A UDS session reads the VIN, live DIDs, and the simulated DTCs; the
+   deterministic analyzer reports its findings. An LLM explanation can be
+   attached as advisory text, but the dashboard never requests one.
+
+On AWS, the IoT Rule forwards the same payloads, `session_id` and
+`event_id` included, to CloudWatch Logs. The existing smoke test has been
+run against the provisioned endpoint (see `docs/aws-setup.md`).
 
 ## 7. AWS services: essential vs. optional
 
 **Essential:** AWS IoT Core (MQTT endpoint, device certificate, IoT
 policy — the primary cloud entry point), IAM (least-privilege policy
-scoped to the one IoT "thing"), CloudWatch (Logs + basic Metrics via an
-IoT Rule action).
+scoped to the one IoT "thing", plus the role the IoT Rule uses to write
+logs), CloudWatch Logs (via the IoT Rule's `cloudwatch_logs` action).
 
 **Deferred/rejected, with rationale documented rather than silently
 dropped:** Kinesis (no genuine throughput need at POC scale), DynamoDB/S3
@@ -351,7 +394,8 @@ since Phase 5.
 
 **What CI actually proves vs. what needs real AWS credentials.** With
 Mosquitto installed, CI runs the full suite against a real local broker
-(as of Phase 8: 166 passed, 1 skipped), covering the simulator, UDS diagnostics, Edge
+(latest verified locally: 226 passed, 1 skipped; Phase 9 and 10 tests
+included), covering the simulator, UDS diagnostics, Edge
 Gateway ingest/validate/normalize/publish, buffering/backoff/replay
 resilience, fault injection, the Phase 8 full-scenario ECU → CAN →
 gateway → MQTT test, and the deterministic analyzer rules, plus

@@ -49,7 +49,9 @@ already have -- a whole session's worth collected via the `on_event`
 callback `simulation/uds/uds_server.run_server()` already exposes (see
 `simulation/uds/tests/test_uds_integration.py` for the exact pattern:
 `events_received.append` passed as `on_event`), a single test's events,
-or, in a later phase, whatever a dashboard backend is holding in memory.
+or whatever a caller is holding in memory -- e.g. the Engineering
+Dashboard's "Run UDS diagnostic session" action (Phase 10), which
+collects one UDS session's events and calls `analyze()` on them.
 Phase 6 deliberately does not add a persistence layer for diagnostic
 events or anomaly reports -- see "Limitations" below.
 
